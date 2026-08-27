@@ -38,10 +38,9 @@ Os dados serão armazenados localmente no dispositivo do usuário, utilizando um
 https://github.com/ParadoxIsReal/TCSII-Trabalho-Mobile
 
 ### Estrutura Inicial de diretórios
-TCSII Mobile/
-│
+```TCSII Mobile/
 ├── README.md
 ├── docs/
 │   └── proposta.md
-│
 └── ...
+```
