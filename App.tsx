@@ -1,16 +1,33 @@
 import { StatusBar } from 'expo-status-bar';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator, NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import {
+  Animated,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
   Pressable,
+  PanResponder,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 import React from 'react';
 
 type Screen = 'home' | 'tutorials' | 'setup' | 'tracking';
+
+type RootStackParamList = {
+  home: undefined;
+  tutorials: undefined;
+  setup: undefined;
+  tracking: undefined;
+};
+
+const Stack = createNativeStackNavigator<RootStackParamList>();
 
 const actions: Array<{
   screen: Exclude<Screen, 'home'>;
@@ -73,6 +90,8 @@ const previewResources = [
   id: `resource-${index + 1}`,
 }));
 
+type Resource = typeof previewResources[number];
+
 const previewActivities = [
   {
     name: 'nomeAtiv',
@@ -104,22 +123,320 @@ const previewActivities = [
   },
 ];
 
+type Activity = typeof previewActivities[number];
+
 export default function App() {
   return (
     <SafeAreaProvider>
-      <AppContent />
+      <NavigationContainer>
+        <Stack.Navigator initialRouteName="home" screenOptions={{ headerShown: false }}>
+          <Stack.Screen name="home">
+            {(props) => <AppContent screen="home" navigation={props.navigation} />}
+          </Stack.Screen>
+          <Stack.Screen name="tutorials">
+            {(props) => <AppContent screen="tutorials" navigation={props.navigation} />}
+          </Stack.Screen>
+          <Stack.Screen name="setup">
+            {(props) => <AppContent screen="setup" navigation={props.navigation} />}
+          </Stack.Screen>
+          <Stack.Screen name="tracking">
+            {(props) => <AppContent screen="tracking" navigation={props.navigation} />}
+          </Stack.Screen>
+        </Stack.Navigator>
+      </NavigationContainer>
     </SafeAreaProvider>
   );
 }
 
-function AppContent() {
-  const [screen, setScreen] = useState<Screen>('home');
+function AppContent({
+  screen,
+  navigation,
+}: {
+  screen: Screen;
+  navigation: NativeStackNavigationProp<RootStackParamList>;
+}) {
   const [categoryPage, setCategoryPage] = useState(0);
+  const [categoryPages, setCategoryPages] = useState(previewCategoryPages);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
-  const visibleCategories = previewCategoryPages[categoryPage];
+  const [categoryModalVisible, setCategoryModalVisible] = useState(false);
+  const [categoryModalMode, setCategoryModalMode] = useState<'add' | 'edit'>('add');
+  const [categoryName, setCategoryName] = useState('');
+  const [resources, setResources] = useState(previewResources);
+  const [resourceModalVisible, setResourceModalVisible] = useState(false);
+  const [resourceModalMode, setResourceModalMode] = useState<'add' | 'edit'>('add');
+  const [editingResourceId, setEditingResourceId] = useState<string | null>(null);
+  const [resourceName, setResourceName] = useState('');
+  const [resourceQuantity, setResourceQuantity] = useState('');
+  const [resourceCategory, setResourceCategory] = useState('');
+  const [resourceDropdownOpen, setResourceDropdownOpen] = useState(false);
+  const [activities, setActivities] = useState(previewActivities);
+  const [activityModalVisible, setActivityModalVisible] = useState(false);
+  const [activityName, setActivityName] = useState('');
+  const [activityCategory, setActivityCategory] = useState('');
+  const [activityCategoryDropdownOpen, setActivityCategoryDropdownOpen] = useState(false);
+  const [activityResourceName, setActivityResourceName] = useState('');
+  const [activityResourceQuantity, setActivityResourceQuantity] = useState('');
+  const [activityResourceDropdownOpen, setActivityResourceDropdownOpen] = useState(false);
+  const [selectedActivityResources, setSelectedActivityResources] = useState<Activity['resources']>([]);
+  const [feedback, setFeedback] = useState<{ mensagem: string; tipo: 'sucesso' | 'cancelado' } | null>(null);
+  const [categoryBoxWidth, setCategoryBoxWidth] = useState(0);
+  const categoryPageRef = useRef(categoryPage);
+  const categoryPagesRef = useRef(categoryPages);
+  const categoryBoxWidthRef = useRef(categoryBoxWidth);
+  const categoryTrackX = useRef(new Animated.Value(0)).current;
+  categoryPageRef.current = categoryPage;
+  categoryPagesRef.current = categoryPages;
+  categoryBoxWidthRef.current = categoryBoxWidth;
+  useEffect(() => {
+    if (feedback === null) {
+      return undefined;
+    }
+
+    const timeout = setTimeout(() => setFeedback(null), 2600);
+    return () => clearTimeout(timeout);
+  }, [feedback]);
+  const openCategoryModal = (mode: 'add' | 'edit') => {
+    setCategoryModalMode(mode);
+    setCategoryName(mode === 'edit' && selectedCategory !== null ? selectedCategory : '');
+    setCategoryModalVisible(true);
+  };
+  const closeCategoryModal = (mostrarFeedback = true) => {
+    setCategoryModalVisible(false);
+    setCategoryName('');
+
+    if (mostrarFeedback) {
+      setFeedback({ mensagem: 'Operação cancelada', tipo: 'cancelado' });
+    }
+  };
+  const saveCategory = () => {
+    const trimmedName = categoryName.trim();
+
+    if (trimmedName.length === 0) {
+      return;
+    }
+
+    if (categoryModalMode === 'edit' && selectedCategory !== null) {
+      setCategoryPages((currentPages) => currentPages.map((page) => page.map((category) => (
+        category === selectedCategory ? trimmedName : category
+      ))));
+      setSelectedCategory(trimmedName);
+    } else {
+      const lastPageIndex = categoryPages.length - 1;
+      const nextPage = categoryPages[lastPageIndex].length >= 6
+        ? categoryPages.length
+        : lastPageIndex;
+
+      setCategoryPages((currentPages) => {
+        const updatedPages = currentPages.map((page) => [...page]);
+        const currentLastPageIndex = updatedPages.length - 1;
+
+        if (updatedPages[currentLastPageIndex].length >= 6) {
+          updatedPages.push([trimmedName]);
+        } else {
+          updatedPages[currentLastPageIndex].push(trimmedName);
+        }
+
+        return updatedPages;
+      });
+      animateToCategoryPage(nextPage);
+    }
+
+    closeCategoryModal(false);
+    setFeedback({
+      mensagem: categoryModalMode === 'edit'
+        ? 'Categoria alterada com sucesso'
+        : 'Categoria adicionada com sucesso',
+      tipo: 'sucesso',
+    });
+  };
+  const openResourceModal = (mode: 'add' | 'edit', resource?: Resource) => {
+    setResourceModalMode(mode);
+    setEditingResourceId(resource?.id ?? null);
+    setResourceName(resource?.name ?? '');
+    setResourceQuantity(resource?.quantity.replace(/^x/, '') ?? '');
+    setResourceCategory(resource?.category ?? selectedCategory ?? categoryPages[0][0]);
+    setResourceDropdownOpen(false);
+    setResourceModalVisible(true);
+  };
+  const closeResourceModal = (mostrarFeedback = true) => {
+    setResourceModalVisible(false);
+    setEditingResourceId(null);
+    setResourceName('');
+    setResourceQuantity('');
+    setResourceCategory('');
+    setResourceDropdownOpen(false);
+
+    if (mostrarFeedback) {
+      setFeedback({ mensagem: 'Operação cancelada', tipo: 'cancelado' });
+    }
+  };
+  const saveResource = () => {
+    const trimmedName = resourceName.trim();
+    const trimmedQuantity = resourceQuantity.trim();
+
+    if (trimmedName.length === 0 || trimmedQuantity.length === 0 || resourceCategory.length === 0) {
+      return;
+    }
+
+    if (resourceModalMode === 'edit' && editingResourceId !== null) {
+      setResources((currentResources) => currentResources.map((resource) => (
+        resource.id === editingResourceId
+          ? { ...resource, name: trimmedName, quantity: `x${trimmedQuantity}`, category: resourceCategory }
+          : resource
+      )));
+    } else {
+      setResources((currentResources) => [
+        ...currentResources,
+        {
+          id: `resource-${Date.now()}`,
+          icon: '*',
+          name: trimmedName,
+          quantity: `x${trimmedQuantity}`,
+          category: resourceCategory,
+        },
+      ]);
+    }
+
+    closeResourceModal(false);
+    setFeedback({
+      mensagem: resourceModalMode === 'edit'
+        ? 'Recurso alterado com sucesso'
+        : 'Recurso adicionado com sucesso',
+      tipo: 'sucesso',
+    });
+  };
+  const openActivityModal = () => {
+    setActivityName('');
+    setActivityCategory(selectedCategory ?? categoryPages[0][0]);
+    setActivityCategoryDropdownOpen(false);
+    setActivityResourceName('');
+    setActivityResourceQuantity('');
+    setActivityResourceDropdownOpen(false);
+    setSelectedActivityResources([]);
+    setActivityModalVisible(true);
+  };
+  const closeActivityModal = (mostrarFeedback = true) => {
+    setActivityModalVisible(false);
+    setActivityName('');
+    setActivityCategory('');
+    setActivityCategoryDropdownOpen(false);
+    setActivityResourceName('');
+    setActivityResourceQuantity('');
+    setActivityResourceDropdownOpen(false);
+    setSelectedActivityResources([]);
+
+    if (mostrarFeedback) {
+      setFeedback({ mensagem: 'Operação cancelada', tipo: 'cancelado' });
+    }
+  };
+  const changeActivityCategory = (category: string) => {
+    setActivityCategory(category);
+    setSelectedActivityResources([]);
+    setActivityResourceName('');
+    setActivityResourceQuantity('');
+    setActivityCategoryDropdownOpen(false);
+    setActivityResourceDropdownOpen(false);
+  };
+  const addActivityResource = () => {
+    const trimmedName = activityResourceName.trim();
+    const quantity = Number(activityResourceQuantity);
+    const alreadyAdded = selectedActivityResources.some((resource) => resource.name === trimmedName);
+
+    if (trimmedName.length === 0 || !Number.isFinite(quantity) || quantity <= 0 || alreadyAdded) {
+      return;
+    }
+
+    setSelectedActivityResources((currentResources) => [
+      ...currentResources,
+      { name: trimmedName, current: 0, required: quantity },
+    ]);
+    setActivityResourceName('');
+    setActivityResourceQuantity('');
+    setActivityResourceDropdownOpen(false);
+  };
+  const saveActivity = () => {
+    const trimmedName = activityName.trim();
+
+    if (trimmedName.length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0) {
+      return;
+    }
+
+    setActivities((currentActivities) => [
+      ...currentActivities,
+      {
+        name: trimmedName,
+        category: activityCategory,
+        resources: selectedActivityResources,
+      },
+    ]);
+    closeActivityModal(false);
+    setFeedback({ mensagem: 'Atividade adicionada com sucesso', tipo: 'sucesso' });
+  };
+  const animateToCategoryPage = (nextPage: number) => {
+    const width = categoryBoxWidthRef.current;
+
+    if (width === 0) {
+      setCategoryPage(nextPage);
+      setSelectedCategory(null);
+      return;
+    }
+
+    Animated.timing(categoryTrackX, {
+      duration: 220,
+      toValue: -nextPage * width,
+      useNativeDriver: true,
+    }).start(() => {
+      setCategoryPage(nextPage);
+      setSelectedCategory(null);
+    });
+  };
+  const categorySwipeResponder = useRef(
+    PanResponder.create({
+      onMoveShouldSetPanResponder: (_, gestureState) => (
+        Math.abs(gestureState.dx) > Math.abs(gestureState.dy)
+        && Math.abs(gestureState.dx) > 12
+      ),
+      onPanResponderMove: (_, gestureState) => {
+        const width = categoryBoxWidthRef.current;
+
+        if (width > 0) {
+          categoryTrackX.setValue(-categoryPageRef.current * width + gestureState.dx);
+        }
+      },
+      onPanResponderRelease: (_, gestureState) => {
+        const currentPage = categoryPageRef.current;
+        const width = categoryBoxWidthRef.current;
+        const pageDirection = gestureState.dx < 0 ? 1 : -1;
+        const shouldChangePage = Math.abs(gestureState.dx) >= 40;
+        const nextPage = shouldChangePage
+          ? Math.min(Math.max(currentPage + pageDirection, 0), categoryPagesRef.current.length - 1)
+          : currentPage;
+
+        if (width === 0) {
+          return;
+        }
+
+        Animated.timing(categoryTrackX, {
+          duration: 220,
+          toValue: -nextPage * width,
+          useNativeDriver: true,
+        }).start(() => {
+          if (nextPage !== currentPage) {
+            setCategoryPage(nextPage);
+            setSelectedCategory(null);
+          }
+        });
+      },
+    }),
+  ).current;
   const visibleResources = selectedCategory === null
-    ? previewResources
-    : previewResources.filter((resource) => resource.category === selectedCategory);
+    ? resources
+    : resources.filter((resource) => resource.category === selectedCategory);
+  const resourceCategoryOptions = Array.from(new Set(categoryPages.flat()));
+  const activityResourceOptions = resources.filter((resource) => (
+    resource.category === activityCategory
+    && !selectedActivityResources.some((selectedResource) => selectedResource.name === resource.name)
+  ));
 
   if (screen !== 'home') {
     if (screen === 'tutorials') {
@@ -127,7 +444,11 @@ function AppContent() {
         <SafeAreaView style={styles.safeArea}>
           <StatusBar style="light" />
           <ScrollView contentContainerStyle={[styles.screenContainer, styles.tutorialContainer]} showsVerticalScrollIndicator={false}>
-            <Pressable accessibilityRole="button" onPress={() => setScreen('home')} style={styles.backBotao}>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => navigation.goBack()}
+              style={({ pressed }) => [styles.backBotao, pressed && styles.botaoPressionado]}
+            >
               <Text style={styles.backBotaoTexto}>{'<'} Voltar</Text>
             </Pressable>
 
@@ -204,7 +525,7 @@ function AppContent() {
                       <Text style={styles.tutorialQuantidadeChecklist}>4/12</Text>
                     </View>
                     <View style={styles.tutorialLinhaChecklist}>
-                      <View style={[styles.tutorialCaixaChecklist, styles.tutorialCaixaChecklistConcluida]}><Text style={styles.tutorialMarcaChecklist}>v</Text></View>
+                      <View style={[styles.tutorialCaixaChecklist, styles.tutorialCaixaChecklistConcluida]}><Text style={styles.tutorialMarcaChecklist}>✓</Text></View>
                       <Text style={[styles.tutorialTextoChecklist, styles.tutorialTextoChecklistConcluido]}>Madeira</Text>
                       <Text style={[styles.tutorialQuantidadeChecklist, styles.tutorialQuantidadeChecklistConcluida]}>8/8</Text>
                     </View>
@@ -217,7 +538,145 @@ function AppContent() {
               <Text style={styles.tutorialIconeDica}>i</Text>
               <Text style={styles.tutorialTextoDica}>O fluxo e continuo: categorias organizam, recursos abastecem e atividades mostram o que falta.</Text>
             </View>
+            <Modal
+              animationType="fade"
+              transparent
+              visible={false}
+              onRequestClose={() => closeActivityModal()}
+            >
+              <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.modalTeclado}>
+                <View style={styles.modalFundo}>
+                  <View style={styles.modalCategoria}>
+                    <Text style={styles.modalCategoriaTitulo}>Nova atividade</Text>
+                    <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} style={styles.modalAtividadeConteudo}>
+                      <TextInput
+                        accessibilityLabel="Nome da atividade"
+                        autoFocus
+                        maxLength={32}
+                        onChangeText={setActivityName}
+                        placeholder="Nome da atividade"
+                        placeholderTextColor="#B8B4C6"
+                        style={styles.modalCategoriaCampo}
+                        value={activityName}
+                      />
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityState={{ expanded: activityCategoryDropdownOpen }}
+                        onPress={() => setActivityCategoryDropdownOpen((isOpen) => !isOpen)}
+                        style={({ pressed }) => [styles.modalRecursoSeletor, pressed && styles.botaoPressionado]}
+                      >
+                        <Text style={styles.modalRecursoSeletorTexto}>{activityCategory || 'Escolha uma categoria'}</Text>
+                        <Text style={styles.modalRecursoSeletorSeta}>{activityCategoryDropdownOpen ? '^' : 'v'}</Text>
+                      </Pressable>
+                      {activityCategoryDropdownOpen && (
+                        <View style={styles.modalRecursoOpcoes}>
+                          {resourceCategoryOptions.map((category) => (
+                            <Pressable
+                              accessibilityRole="button"
+                              key={category}
+                              onPress={() => changeActivityCategory(category)}
+                              style={({ pressed }) => [styles.modalRecursoOpcao, pressed && styles.botaoPressionado]}
+                            >
+                              <Text style={styles.modalRecursoOpcaoTexto}>{category}</Text>
+                            </Pressable>
+                          ))}
+                        </View>
+                      )}
+                      <View style={styles.modalAtividadeLinhaEntrada}>
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityState={{ expanded: activityResourceDropdownOpen }}
+                          onPress={() => setActivityResourceDropdownOpen((isOpen) => !isOpen)}
+                          style={({ pressed }) => [styles.modalRecursoSeletor, styles.modalAtividadeSeletorRecurso, pressed && styles.botaoPressionado]}
+                        >
+                          <Text style={styles.modalRecursoSeletorTexto} numberOfLines={1}>{activityResourceName || 'Escolha o recurso'}</Text>
+                          <Text style={styles.modalRecursoSeletorSeta}>{activityResourceDropdownOpen ? '^' : 'v'}</Text>
+                        </Pressable>
+                        <TextInput
+                          accessibilityLabel="Quantidade necessária"
+                          keyboardType="numeric"
+                          maxLength={9}
+                          onChangeText={(value) => setActivityResourceQuantity(value.replace(/[^0-9]/g, ''))}
+                          placeholder="Qtd."
+                          placeholderTextColor="#B8B4C6"
+                          style={styles.modalAtividadeQuantidade}
+                          value={activityResourceQuantity}
+                        />
+                      </View>
+                      {activityResourceDropdownOpen && (
+                        <View style={styles.modalRecursoOpcoes}>
+                          {activityResourceOptions.map((resource) => (
+                            <Pressable
+                              accessibilityRole="button"
+                              key={resource.id}
+                              onPress={() => {
+                                setActivityResourceName(resource.name);
+                                setActivityResourceDropdownOpen(false);
+                              }}
+                              style={({ pressed }) => [styles.modalRecursoOpcao, pressed && styles.botaoPressionado]}
+                            >
+                              <Text style={styles.modalRecursoOpcaoTexto}>{resource.name}</Text>
+                            </Pressable>
+                          ))}
+                          {activityResourceOptions.length === 0 && <Text style={styles.modalAtividadeVazio}>Todos os recursos desta categoria já foram adicionados.</Text>}
+                        </View>
+                      )}
+                      <Pressable
+                        accessibilityRole="button"
+                        disabled={activityResourceName.length === 0 || activityResourceQuantity.length === 0}
+                        onPress={addActivityResource}
+                        style={({ pressed }) => [
+                          styles.toolbarBotao,
+                          styles.modalAtividadeAdicionar,
+                          (activityResourceName.length === 0 || activityResourceQuantity.length === 0) && styles.toolbarBotaoDisable,
+                          pressed && styles.botaoPressionado,
+                        ]}
+                      >
+                        <Text style={styles.toolbarIcone}>+</Text>
+                        <Text style={styles.toolbarRotulo}>Adicionar recurso</Text>
+                      </Pressable>
+                      {selectedActivityResources.length > 0 && (
+                        <View style={styles.modalAtividadeSelecionados}>
+                          {selectedActivityResources.map((resource) => (
+                            <View key={resource.name} style={styles.recursoRow}>
+                              <Text style={styles.recursoNome}>{resource.name}</Text>
+                              <Text style={styles.recursoQuantidade}>x{resource.required}</Text>
+                              <Pressable
+                                accessibilityRole="button"
+                                accessibilityLabel={`Remover ${resource.name}`}
+                                onPress={() => setSelectedActivityResources((currentResources) => currentResources.filter((item) => item.name !== resource.name))}
+                                style={({ pressed }) => [styles.recursoBotaoIcone, pressed && styles.botaoPressionado]}
+                              >
+                                <Text style={styles.recursoTextoBotao}>&#10005;</Text>
+                              </Pressable>
+                            </View>
+                          ))}
+                        </View>
+                      )}
+                    </ScrollView>
+                    <View style={styles.modalCategoriaAcoes}>
+                      <Pressable accessibilityRole="button" onPress={() => closeActivityModal()} style={({ pressed }) => [styles.modalCategoriaBotao, pressed && styles.botaoPressionado]}>
+                        <Text style={styles.novaAtividadeTexto}>Cancelar</Text>
+                      </Pressable>
+                      <Pressable
+                        accessibilityRole="button"
+                        disabled={activityName.trim().length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0}
+                        onPress={saveActivity}
+                        style={({ pressed }) => [
+                          styles.modalCategoriaBotao,
+                          (activityName.trim().length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0) && styles.toolbarBotaoDisable,
+                          pressed && styles.botaoPressionado,
+                        ]}
+                      >
+                        <Text style={styles.novaAtividadeTexto}>Salvar</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                </View>
+              </KeyboardAvoidingView>
+            </Modal>
           </ScrollView>
+          <FloatingHomeButton navigation={navigation} />
         </SafeAreaView>
       );
     }
@@ -227,7 +686,11 @@ function AppContent() {
         <SafeAreaView style={styles.safeArea}>
           <StatusBar style="light" />
           <ScrollView contentContainerStyle={[styles.screenContainer, styles.containerAtividades]} showsVerticalScrollIndicator={false}>
-            <Pressable accessibilityRole="button" onPress={() => setScreen('home')} style={styles.backBotao}>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => navigation.goBack()}
+              style={({ pressed }) => [styles.backBotao, pressed && styles.botaoPressionado]}
+            >
               <Text style={styles.backBotaoTexto}>{'<'} Voltar</Text>
             </Pressable>
 
@@ -236,12 +699,12 @@ function AppContent() {
                 <Text style={styles.kicker}>ACOMPANHAR</Text>
                 <Text style={styles.tituloAtividades}>Atividades</Text>
               </View>
-              <Text style={styles.contadorAtividades}>{previewActivities.length} atividades</Text>
+              <Text style={styles.contadorAtividades}>{activities.length} atividades</Text>
             </View>
 
             <Pressable
               accessibilityRole="button"
-              onPress={() => undefined}
+              onPress={openActivityModal}
               style={({ pressed }) => [styles.novaAtividadeButton, pressed && styles.novaAtividadeButtonPressed]}
             >
               <Text style={styles.novaAtividadeIcone}>+</Text>
@@ -253,7 +716,7 @@ function AppContent() {
             </Pressable>
 
             <View style={styles.listaAtividades}>
-              {previewActivities.map((activity, activityIndex) => {
+              {activities.map((activity, activityIndex) => {
                 const completedCount = activity.resources.filter((resource) => resource.current >= resource.required).length;
                 const activityIsComplete = completedCount === activity.resources.length;
                 const hiddenResourceCount = Math.max(activity.resources.length - 3, 0);
@@ -288,7 +751,7 @@ function AppContent() {
                             style={styles.linhaRecursoAtividade}
                           >
                             <View style={[styles.caixaRecursoAtividade, isComplete && styles.caixaRecursoAtividadeCompleta]}>
-                              {isComplete && <Text style={styles.marcaRecursoAtividade}>v</Text>}
+                              {isComplete && <Text style={styles.marcaRecursoAtividade}>✓</Text>}
                             </View>
                             <Text style={[styles.nomeRecursoAtividade, isComplete && styles.nomeRecursoAtividadeCompleto]}>
                               {resource.name}
@@ -307,7 +770,80 @@ function AppContent() {
                 );
               })}
             </View>
+            <Modal
+              animationType="fade"
+              transparent
+              visible={activityModalVisible}
+              onRequestClose={() => closeActivityModal()}
+            >
+              <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.modalTeclado}>
+                <View style={styles.modalFundo}>
+                  <View style={styles.modalCategoria}>
+                    <Text style={styles.modalCategoriaTitulo}>Nova atividade</Text>
+                    <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} style={styles.modalAtividadeConteudo}>
+                      <TextInput accessibilityLabel="Nome da atividade" autoFocus maxLength={32} onChangeText={setActivityName} placeholder="Nome da atividade" placeholderTextColor="#B8B4C6" style={styles.modalCategoriaCampo} value={activityName} />
+                      <Pressable accessibilityRole="button" accessibilityState={{ expanded: activityCategoryDropdownOpen }} onPress={() => setActivityCategoryDropdownOpen((isOpen) => !isOpen)} style={({ pressed }) => [styles.modalRecursoSeletor, pressed && styles.botaoPressionado]}>
+                        <Text style={styles.modalRecursoSeletorTexto}>{activityCategory || 'Escolha uma categoria'}</Text>
+                        <Text style={styles.modalRecursoSeletorSeta}>{activityCategoryDropdownOpen ? '^' : 'v'}</Text>
+                      </Pressable>
+                      {activityCategoryDropdownOpen && (
+                        <View style={styles.modalRecursoOpcoes}>
+                          {resourceCategoryOptions.map((category) => (
+                            <Pressable accessibilityRole="button" key={category} onPress={() => changeActivityCategory(category)} style={({ pressed }) => [styles.modalRecursoOpcao, pressed && styles.botaoPressionado]}>
+                              <Text style={styles.modalRecursoOpcaoTexto}>{category}</Text>
+                            </Pressable>
+                          ))}
+                        </View>
+                      )}
+                      <View style={styles.modalAtividadeLinhaEntrada}>
+                        <Pressable accessibilityRole="button" accessibilityState={{ expanded: activityResourceDropdownOpen }} onPress={() => setActivityResourceDropdownOpen((isOpen) => !isOpen)} style={({ pressed }) => [styles.modalRecursoSeletor, styles.modalAtividadeSeletorRecurso, pressed && styles.botaoPressionado]}>
+                          <Text style={styles.modalRecursoSeletorTexto} numberOfLines={1}>{activityResourceName || 'Escolha o recurso'}</Text>
+                          <Text style={styles.modalRecursoSeletorSeta}>{activityResourceDropdownOpen ? '^' : 'v'}</Text>
+                        </Pressable>
+                        <TextInput accessibilityLabel="Quantidade necessária" keyboardType="numeric" maxLength={9} onChangeText={(value) => setActivityResourceQuantity(value.replace(/[^0-9]/g, ''))} placeholder="Qtd." placeholderTextColor="#B8B4C6" style={styles.modalAtividadeQuantidade} value={activityResourceQuantity} />
+                      </View>
+                      {activityResourceDropdownOpen && (
+                        <View style={styles.modalRecursoOpcoes}>
+                          {activityResourceOptions.map((resource) => (
+                            <Pressable accessibilityRole="button" key={resource.id} onPress={() => { setActivityResourceName(resource.name); setActivityResourceDropdownOpen(false); }} style={({ pressed }) => [styles.modalRecursoOpcao, pressed && styles.botaoPressionado]}>
+                              <Text style={styles.modalRecursoOpcaoTexto}>{resource.name}</Text>
+                            </Pressable>
+                          ))}
+                          {activityResourceOptions.length === 0 && <Text style={styles.modalAtividadeVazio}>Todos os recursos desta categoria já foram adicionados.</Text>}
+                        </View>
+                      )}
+                      <Pressable accessibilityRole="button" disabled={activityResourceName.length === 0 || activityResourceQuantity.length === 0} onPress={addActivityResource} style={({ pressed }) => [styles.toolbarBotao, styles.modalAtividadeAdicionar, (activityResourceName.length === 0 || activityResourceQuantity.length === 0) && styles.toolbarBotaoDisable, pressed && styles.botaoPressionado]}>
+                        <Text style={styles.toolbarIcone}>+</Text>
+                        <Text style={styles.toolbarRotulo}>Adicionar recurso</Text>
+                      </Pressable>
+                      {selectedActivityResources.length > 0 && (
+                        <View style={styles.modalAtividadeSelecionados}>
+                          {selectedActivityResources.map((resource) => (
+                            <View key={resource.name} style={styles.recursoRow}>
+                              <Text style={styles.recursoNome}>{resource.name}</Text>
+                              <Text style={styles.recursoQuantidade}>x{resource.required}</Text>
+                              <Pressable accessibilityRole="button" accessibilityLabel={`Remover ${resource.name}`} onPress={() => setSelectedActivityResources((currentResources) => currentResources.filter((item) => item.name !== resource.name))} style={({ pressed }) => [styles.recursoBotaoIcone, pressed && styles.botaoPressionado]}>
+                                <Text style={styles.recursoTextoBotao}>&#10005;</Text>
+                              </Pressable>
+                            </View>
+                          ))}
+                        </View>
+                      )}
+                    </ScrollView>
+                    <View style={styles.modalCategoriaAcoes}>
+                      <Pressable accessibilityRole="button" onPress={() => closeActivityModal()} style={({ pressed }) => [styles.modalCategoriaBotao, pressed && styles.botaoPressionado]}>
+                        <Text style={styles.novaAtividadeTexto}>Cancelar</Text>
+                      </Pressable>
+                      <Pressable accessibilityRole="button" disabled={activityName.trim().length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0} onPress={saveActivity} style={({ pressed }) => [styles.modalCategoriaBotao, (activityName.trim().length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0) && styles.toolbarBotaoDisable, pressed && styles.botaoPressionado]}>
+                        <Text style={styles.novaAtividadeTexto}>Salvar</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                </View>
+              </KeyboardAvoidingView>
+            </Modal>
           </ScrollView>
+          <FloatingHomeButton navigation={navigation} />
         </SafeAreaView>
       );
     }
@@ -317,7 +853,11 @@ function AppContent() {
         <SafeAreaView style={styles.safeArea}>
           <StatusBar style="light" />
           <ScrollView contentContainerStyle={[styles.screenContainer, styles.setupContainer]} showsVerticalScrollIndicator={false}>
-            <Pressable accessibilityRole="button" onPress={() => setScreen('home')} style={styles.backBotao}>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => navigation.goBack()}
+              style={({ pressed }) => [styles.backBotao, pressed && styles.botaoPressionado]}
+            >
               <Text style={styles.backBotaoTexto}>{'<'} Voltar</Text>
             </Pressable>
 
@@ -331,39 +871,59 @@ function AppContent() {
                 <Text style={styles.categoriaTitulo}>Categorias</Text>
                 <Text style={styles.categoriaDica}>Selecione uma categoria para gerenciar</Text>
               </View>
-              <Text style={styles.pageLabel}>{categoryPage + 1} / {previewCategoryPages.length}</Text>
+              <Text style={styles.pageLabel}>{categoryPage + 1} / {categoryPages.length}</Text>
             </View>
 
             <View style={[styles.surface, styles.categoriaBox]}>
-              <View style={styles.categoriaGrid}>
-                {visibleCategories.map((category) => {
-                  const isSelected = selectedCategory === category;
+              <View
+                {...categorySwipeResponder.panHandlers}
+                onLayout={(event) => {
+                  const width = event.nativeEvent.layout.width;
+                  setCategoryBoxWidth(width);
+                  categoryTrackX.setValue(-categoryPageRef.current * width);
+                }}
+                style={styles.categoriaViewport}
+              >
+                <Animated.View style={[styles.categoriaTrack, { transform: [{ translateX: categoryTrackX }] }]}>
+                  {categoryPages.map((categories, pageIndex) => (
+                    <View key={`category-page-${pageIndex}`} style={[styles.categoriaPagina, { width: categoryBoxWidth || '100%' }]}>
+                      <View style={styles.categoriaGrid}>
+                        {categories.map((category) => {
+                          const isSelected = selectedCategory === category;
 
-                  return (
-                    <Pressable
-                      accessibilityRole="button"
-                      accessibilityState={{ selected: isSelected }}
-                      key={category}
-                      onPress={() => setSelectedCategory(isSelected ? null : category)}
-                      style={({ pressed }) => [
-                        styles.categoriaItem,
-                        isSelected && styles.categoriaItemSelected,
-                        pressed && styles.categoriaItemPressed,
-                      ]}
-                    >
-                      <Text style={[styles.categoriaItemTexto, isSelected && styles.categoriaItemTextoSelected]}>
-                        {category}
-                      </Text>
-                      <View style={[styles.categoriaRadio, isSelected && styles.categoriaRadioSelected]}>
-                        {isSelected && <View style={styles.categoriaRadioDot} />}
+                          return (
+                            <Pressable
+                              accessibilityRole="button"
+                              accessibilityState={{ selected: isSelected }}
+                              key={category}
+                              onPress={() => setSelectedCategory(isSelected ? null : category)}
+                              style={({ pressed }) => [
+                                styles.categoriaItem,
+                                isSelected && styles.categoriaItemSelected,
+                                pressed && styles.categoriaItemPressed,
+                              ]}
+                            >
+                              <Text style={[styles.categoriaItemTexto, isSelected && styles.categoriaItemTextoSelected]}>
+                                {category}
+                              </Text>
+                              <View style={[styles.categoriaRadio, isSelected && styles.categoriaRadioSelected]}>
+                                {isSelected && <View style={styles.categoriaRadioDot} />}
+                              </View>
+                            </Pressable>
+                          );
+                        })}
                       </View>
-                    </Pressable>
-                  );
-                })}
+                    </View>
+                  ))}
+                </Animated.View>
               </View>
 
               <View style={styles.categoriaToolbar}>
-                <Pressable accessibilityRole="button" onPress={() => undefined} style={styles.toolbarBotao}>
+                <Pressable
+                  accessibilityRole="button"
+                  onPress={() => openCategoryModal('add')}
+                  style={({ pressed }) => [styles.toolbarBotao, pressed && styles.botaoPressionado]}
+                >
                   <Text style={styles.toolbarIcone}>+</Text>
                   <Text style={styles.toolbarRotulo}>Adicionar</Text>
                 </Pressable>
@@ -371,8 +931,12 @@ function AppContent() {
                   accessibilityRole="button"
                   accessibilityState={{ disabled: selectedCategory === null }}
                   disabled={selectedCategory === null}
-                  onPress={() => undefined}
-                  style={[styles.toolbarBotao, selectedCategory === null && styles.toolbarBotaoDisable]}
+                  onPress={() => openCategoryModal('edit')}
+                  style={({ pressed }) => [
+                    styles.toolbarBotao,
+                    selectedCategory === null && styles.toolbarBotaoDisable,
+                    pressed && styles.botaoPressionado,
+                  ]}
                 >
                   <Text style={styles.toolbarIcone}>&#x270E;</Text>
                   <Text style={styles.toolbarRotulo}>Editar</Text>
@@ -382,7 +946,11 @@ function AppContent() {
                   accessibilityState={{ disabled: selectedCategory === null }}
                   disabled={selectedCategory === null}
                   onPress={() => setSelectedCategory(null)}
-                  style={[styles.toolbarBotao, selectedCategory === null && styles.toolbarBotaoDisable]}
+                  style={({ pressed }) => [
+                    styles.toolbarBotao,
+                    selectedCategory === null && styles.toolbarBotaoDisable,
+                    pressed && styles.botaoPressionado,
+                  ]}
                 >
                   <Text style={styles.toolbarIcone}>&#10005;</Text>
                   <Text style={styles.toolbarRotulo}>Excluir</Text>
@@ -393,24 +961,26 @@ function AppContent() {
                   accessibilityLabel="Pagina anterior"
                   accessibilityState={{ disabled: categoryPage === 0 }}
                   disabled={categoryPage === 0}
-                  onPress={() => {
-                    setCategoryPage((currentPage) => Math.max(currentPage - 1, 0));
-                    setSelectedCategory(null);
-                  }}
-                  style={[styles.pageBotao, categoryPage === 0 && styles.toolbarBotaoDisable]}
+                  onPress={() => animateToCategoryPage(Math.max(categoryPage - 1, 0))}
+                  style={({ pressed }) => [
+                    styles.pageBotao,
+                    categoryPage === 0 && styles.toolbarBotaoDisable,
+                    pressed && styles.botaoPressionado,
+                  ]}
                 >
                     <Text style={styles.pageSeta}>{'<<'}</Text>
                 </Pressable>
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel="Proxima pagina"
-                  accessibilityState={{ disabled: categoryPage === previewCategoryPages.length - 1 }}
-                  disabled={categoryPage === previewCategoryPages.length - 1}
-                  onPress={() => {
-                    setCategoryPage((currentPage) => Math.min(currentPage + 1, previewCategoryPages.length - 1));
-                    setSelectedCategory(null);
-                  }}
-                  style={[styles.pageBotao, categoryPage === previewCategoryPages.length - 1 && styles.toolbarBotaoDisable]}
+                  accessibilityState={{ disabled: categoryPage === categoryPages.length - 1 }}
+                  disabled={categoryPage === categoryPages.length - 1}
+                  onPress={() => animateToCategoryPage(Math.min(categoryPage + 1, categoryPages.length - 1))}
+                  style={({ pressed }) => [
+                    styles.pageBotao,
+                    categoryPage === categoryPages.length - 1 && styles.toolbarBotaoDisable,
+                    pressed && styles.botaoPressionado,
+                  ]}
                 >
                   <Text style={styles.pageSeta}>{'>>'}</Text>
                 </Pressable>
@@ -430,11 +1000,19 @@ function AppContent() {
             <View style={[styles.surface, styles.recursoBox]}>
               <View style={styles.recursoToolbar}>
                 <View style={styles.recursoToolbarAcao}>
-                  <Pressable accessibilityRole="button" onPress={() => undefined} style={styles.recursoAcaoBotao}>
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() => openResourceModal('add')}
+                    style={({ pressed }) => [styles.recursoAcaoBotao, pressed && styles.botaoPressionado]}
+                  >
                     <Text style={styles.toolbarIcone}>+</Text>
                     <Text style={styles.toolbarRotulo}>Adicionar</Text>
                   </Pressable>
-                  <Pressable accessibilityRole="button" onPress={() => undefined} style={styles.recursoAcaoBotao}>
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() => undefined}
+                    style={({ pressed }) => [styles.recursoAcaoBotao, pressed && styles.botaoPressionado]}
+                  >
                     <Text style={styles.toolbarIcone}>&#10005;</Text>
                     <Text style={styles.toolbarRotulo}>Limpar</Text>
                   </Pressable>
@@ -456,17 +1034,176 @@ function AppContent() {
                       <Text style={styles.recursoNome}>{resource.name}</Text>
                     </View>
                     <Text style={styles.recursoQuantidade}>{resource.quantity}</Text>
-                    <Pressable accessibilityRole="button" accessibilityLabel={`Editar ${resource.name}`} onPress={() => undefined} style={styles.recursoBotaoIcone}>
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={`Editar ${resource.name}`}
+                      onPress={() => openResourceModal('edit', resource)}
+                      style={({ pressed }) => [styles.recursoBotaoIcone, pressed && styles.botaoPressionado]}
+                    >
                       <Text style={styles.recursoTextoBotao}>&#x270E;</Text>
                     </Pressable>
-                    <Pressable accessibilityRole="button" accessibilityLabel={`Excluir ${resource.name}`} onPress={() => undefined} style={styles.recursoBotaoIcone}>
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={`Excluir ${resource.name}`}
+                      onPress={() => undefined}
+                      style={({ pressed }) => [styles.recursoBotaoIcone, pressed && styles.botaoPressionado]}
+                    >
                       <Text style={styles.recursoTextoBotao}>&#10005;</Text>
                     </Pressable>
                   </View>
                 ))}
               </ScrollView>
             </View>
+
+            <Modal
+              animationType="fade"
+              transparent
+              visible={categoryModalVisible}
+              onRequestClose={() => closeCategoryModal()}
+            >
+              <KeyboardAvoidingView
+                behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+                style={styles.modalTeclado}
+              >
+                <View style={styles.modalFundo}>
+                  <View style={styles.modalCategoria}>
+                    <Text style={styles.modalCategoriaTitulo}>
+                      {categoryModalMode === 'edit' ? 'Editar categoria' : 'Nova categoria'}
+                    </Text>
+                    <TextInput
+                      accessibilityLabel="Nome da categoria"
+                      autoFocus
+                      maxLength={32}
+                      onChangeText={setCategoryName}
+                      onSubmitEditing={saveCategory}
+                      placeholder="Nome da categoria"
+                      placeholderTextColor="#B8B4C6"
+                      returnKeyType="done"
+                      style={styles.modalCategoriaCampo}
+                      value={categoryName}
+                    />
+                    <View style={styles.modalCategoriaAcoes}>
+                      <Pressable
+                        accessibilityRole="button"
+                        onPress={() => closeCategoryModal()}
+                        style={({ pressed }) => [styles.modalCategoriaBotao, pressed && styles.botaoPressionado]}
+                      >
+                        <Text style={styles.novaAtividadeTexto}>Cancelar</Text>
+                      </Pressable>
+                      <Pressable
+                        accessibilityRole="button"
+                        disabled={categoryName.trim().length === 0}
+                        onPress={saveCategory}
+                        style={({ pressed }) => [
+                          styles.modalCategoriaBotao,
+                          categoryName.trim().length === 0 && styles.toolbarBotaoDisable,
+                          pressed && styles.botaoPressionado,
+                        ]}
+                      >
+                        <Text style={styles.novaAtividadeTexto}>Salvar</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                </View>
+              </KeyboardAvoidingView>
+            </Modal>
+
+            <Modal
+              animationType="fade"
+              transparent
+              visible={resourceModalVisible}
+              onRequestClose={() => closeResourceModal()}
+            >
+              <KeyboardAvoidingView
+                behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+                style={styles.modalTeclado}
+              >
+                <View style={styles.modalFundo}>
+                  <View style={styles.modalCategoria}>
+                    <Text style={styles.modalCategoriaTitulo}>
+                      {resourceModalMode === 'edit' ? 'Editar recurso' : 'Novo recurso'}
+                    </Text>
+                    <TextInput
+                      accessibilityLabel="Nome do recurso"
+                      autoFocus
+                      maxLength={32}
+                      onChangeText={setResourceName}
+                      placeholder="Nome do recurso"
+                      placeholderTextColor="#B8B4C6"
+                      style={styles.modalCategoriaCampo}
+                      value={resourceName}
+                    />
+                    <TextInput
+                      accessibilityLabel="Quantidade do recurso"
+                      keyboardType="numeric"
+                      maxLength={9}
+                      onChangeText={(value) => setResourceQuantity(value.replace(/[^0-9]/g, ''))}
+                      placeholder="Quantidade"
+                      placeholderTextColor="#B8B4C6"
+                      style={[styles.modalCategoriaCampo, styles.modalRecursoQuantidadeCampo]}
+                      value={resourceQuantity}
+                    />
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityState={{ expanded: resourceDropdownOpen }}
+                      onPress={() => setResourceDropdownOpen((isOpen) => !isOpen)}
+                      style={({ pressed }) => [styles.modalRecursoSeletor, pressed && styles.botaoPressionado]}
+                    >
+                      <Text style={styles.modalRecursoSeletorTexto}>
+                        {resourceCategory || 'Escolha uma categoria'}
+                      </Text>
+                      <Text style={styles.modalRecursoSeletorSeta}>{resourceDropdownOpen ? '^' : 'v'}</Text>
+                    </Pressable>
+                    {resourceDropdownOpen && (
+                      <ScrollView style={styles.modalRecursoOpcoes} nestedScrollEnabled>
+                        {resourceCategoryOptions.map((category) => (
+                          <Pressable
+                            accessibilityRole="button"
+                            key={category}
+                            onPress={() => {
+                              setResourceCategory(category);
+                              setResourceDropdownOpen(false);
+                            }}
+                            style={({ pressed }) => [styles.modalRecursoOpcao, pressed && styles.botaoPressionado]}
+                          >
+                            <Text style={styles.modalRecursoOpcaoTexto}>{category}</Text>
+                          </Pressable>
+                        ))}
+                      </ScrollView>
+                    )}
+                    <View style={styles.modalCategoriaAcoes}>
+                      <Pressable
+                        accessibilityRole="button"
+                        onPress={() => closeResourceModal()}
+                        style={({ pressed }) => [styles.modalCategoriaBotao, pressed && styles.botaoPressionado]}
+                      >
+                        <Text style={styles.novaAtividadeTexto}>Cancelar</Text>
+                      </Pressable>
+                      <Pressable
+                        accessibilityRole="button"
+                        disabled={resourceName.trim().length === 0 || resourceQuantity.trim().length === 0 || resourceCategory.length === 0}
+                        onPress={saveResource}
+                        style={({ pressed }) => [
+                          styles.modalCategoriaBotao,
+                          (resourceName.trim().length === 0 || resourceQuantity.trim().length === 0 || resourceCategory.length === 0) && styles.toolbarBotaoDisable,
+                          pressed && styles.botaoPressionado,
+                        ]}
+                      >
+                        <Text style={styles.novaAtividadeTexto}>Salvar</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                </View>
+              </KeyboardAvoidingView>
+            </Modal>
+
           </ScrollView>
+          {feedback !== null && (
+            <View style={[styles.feedbackPopup, feedback.tipo === 'sucesso' ? styles.feedbackPopupSucesso : styles.feedbackPopupCancelado]}>
+              <Text style={styles.feedbackPopupTexto}>{feedback.mensagem}</Text>
+            </View>
+          )}
+          <FloatingHomeButton navigation={navigation} />
         </SafeAreaView>
       );
     }
@@ -499,7 +1236,7 @@ function AppContent() {
             <Pressable
               accessibilityRole="button"
               key={action.screen}
-              onPress={() => setScreen(action.screen)}
+              onPress={() => navigation.navigate(action.screen)}
               style={({ pressed }) => [styles.actionCard, pressed && styles.actionCardPressed]}
             >
               <View style={styles.actionIcone}>
@@ -518,6 +1255,23 @@ function AppContent() {
         <Text style={styles.footerNote}>Dados salvos local no dispositivo.</Text>
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+function FloatingHomeButton({
+  navigation,
+}: {
+  navigation: NativeStackNavigationProp<RootStackParamList>;
+}) {
+  return (
+    <Pressable
+      accessibilityLabel="Voltar para a tela principal"
+      accessibilityRole="button"
+      onPress={() => navigation.reset({ index: 0, routes: [{ name: 'home' }] })}
+      style={({ pressed }) => [styles.floatingBotaoCasa, pressed && styles.floatingBotaoCasaPressed]}
+    >
+      <Text style={styles.floatingIconeCasa}>⌂</Text>
+    </Pressable>
   );
 }
 
@@ -713,7 +1467,7 @@ const styles = StyleSheet.create({
     marginBottom: 7,
   },
   tutorialDescricaoEtapa: {
-    color: '#AAA6BA',
+    color: '#FFFFFF',
     fontSize: 13,
     lineHeight: 19,
   },
@@ -848,7 +1602,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   tutorialTextoChecklist: {
-    color: '#D2CCDF',
+    color: '#FFFFFF',
     flex: 1,
     fontSize: 11,
     fontWeight: '700',
@@ -889,7 +1643,7 @@ const styles = StyleSheet.create({
     width: 20,
   },
   tutorialTextoDica: {
-    color: '#D2CCDF',
+    color: '#FFFFFF',
     flex: 1,
     fontSize: 12,
     lineHeight: 18,
@@ -1051,7 +1805,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   nomeRecursoAtividade: {
-    color: '#D2CCDF',
+    color: '#FFFFFF',
     flex: 1,
     fontSize: 13,
     fontWeight: '700',
@@ -1105,7 +1859,7 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   categoriaDica: {
-    color: '#898598',
+    color: '#FFFFFF',
     fontSize: 11,
     marginTop: 4,
   },
@@ -1117,6 +1871,15 @@ const styles = StyleSheet.create({
   },
   categoriaBox: {
     overflow: 'hidden',
+  },
+  categoriaViewport: {
+    overflow: 'hidden',
+  },
+  categoriaTrack: {
+    flexDirection: 'row',
+  },
+  categoriaPagina: {
+    flexShrink: 0,
   },
   categoriaGrid: {
     flexDirection: 'row',
@@ -1181,6 +1944,9 @@ const styles = StyleSheet.create({
   },
   toolbarBotao: {
     alignItems: 'center',
+    borderColor: '#5B4A82',
+    borderRadius: 8,
+    borderWidth: 1,
     flexDirection: 'row',
     flexShrink: 1,
     gap: 6,
@@ -1188,7 +1954,8 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
   },
   toolbarBotaoDisable: {
-    opacity: 0.35,
+    backgroundColor: '#592F36',
+    borderColor: '#8A4A52',
   },
   toolbarIcone: {
     color: '#C4B5FD',
@@ -1209,6 +1976,9 @@ const styles = StyleSheet.create({
   },
   pageBotao: {
     alignItems: 'center',
+    borderColor: '#5B4A82',
+    borderRadius: 8,
+    borderWidth: 1,
     height: 42,
     justifyContent: 'center',
     width: 38,
@@ -1237,9 +2007,13 @@ const styles = StyleSheet.create({
   },
   recursoAcaoBotao: {
     alignItems: 'center',
+    borderColor: '#5B4A82',
+    borderRadius: 8,
+    borderWidth: 1,
     flexDirection: 'row',
     gap: 4,
     marginLeft: 8,
+    paddingHorizontal: 8,
     paddingVertical: 8,
   },
   recursoLista: {
@@ -1285,6 +2059,9 @@ const styles = StyleSheet.create({
   },
   recursoBotaoIcone: {
     alignItems: 'center',
+    borderColor: '#5B4A82',
+    borderRadius: 8,
+    borderWidth: 1,
     height: 42,
     justifyContent: 'center',
     width: 34,
@@ -1302,5 +2079,204 @@ const styles = StyleSheet.create({
     color: '#A78BFA',
     fontSize: 15,
     fontWeight: '800',
+  },
+  botaoPressionado: {
+    backgroundColor: '#302846',
+    borderColor: '#A78BFA',
+    transform: [{ scale: 0.96 }],
+  },
+  modalTeclado: {
+    flex: 1,
+  },
+  modalFundo: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.68)',
+    flex: 1,
+    justifyContent: 'center',
+    padding: 20,
+  },
+  modalCategoria: {
+    backgroundColor: '#24242D',
+    borderColor: '#5B4A82',
+    borderRadius: 16,
+    borderWidth: 1,
+    maxWidth: 420,
+    padding: 18,
+    width: '100%',
+  },
+  modalCategoriaTitulo: {
+    color: '#FFFFFF',
+    fontSize: 20,
+    fontWeight: '900',
+    marginBottom: 14,
+  },
+  modalCategoriaCampo: {
+    backgroundColor: '#17171C',
+    borderColor: '#817B91',
+    borderRadius: 10,
+    borderWidth: 1,
+    color: '#FFFFFF',
+    fontSize: 16,
+    minHeight: 52,
+    paddingHorizontal: 14,
+  },
+  modalRecursoQuantidadeCampo: {
+    marginTop: 10,
+  },
+  modalCategoriaAcoes: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 16,
+  },
+  modalCategoriaBotao: {
+    alignItems: 'center',
+    backgroundColor: '#24242D',
+    borderColor: '#5B4A82',
+    borderRadius: 10,
+    borderWidth: 1,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 52,
+    paddingHorizontal: 12,
+  },
+  modalAtividadeConteudo: {
+    maxHeight: 360,
+  },
+  modalAtividadeLinhaEntrada: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 10,
+  },
+  modalAtividadeSeletorRecurso: {
+    flex: 1,
+    marginTop: 0,
+  },
+  modalAtividadeQuantidade: {
+    backgroundColor: '#17171C',
+    borderColor: '#817B91',
+    borderRadius: 10,
+    borderWidth: 1,
+    color: '#FFFFFF',
+    fontSize: 15,
+    minHeight: 52,
+    paddingHorizontal: 12,
+    textAlign: 'center',
+    width: 72,
+  },
+  modalAtividadeAdicionar: {
+    justifyContent: 'center',
+    marginTop: 10,
+  },
+  modalAtividadeSelecionados: {
+    backgroundColor: '#17171C',
+    borderColor: '#393544',
+    borderRadius: 10,
+    borderWidth: 1,
+    marginTop: 12,
+    overflow: 'hidden',
+  },
+  modalAtividadeVazio: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    padding: 12,
+  },
+  modalRecursoSeletor: {
+    alignItems: 'center',
+    backgroundColor: '#24242D',
+    borderColor: '#5B4A82',
+    borderRadius: 10,
+    borderWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 10,
+    minHeight: 52,
+    paddingHorizontal: 14,
+  },
+  modalRecursoSeletorTexto: {
+    color: '#FFFFFF',
+    flex: 1,
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  modalRecursoSeletorSeta: {
+    color: '#C4B5FD',
+    fontSize: 18,
+    fontWeight: '900',
+    marginLeft: 10,
+  },
+  modalRecursoOpcoes: {
+    backgroundColor: '#17171C',
+    borderColor: '#5B4A82',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginTop: 6,
+    maxHeight: 150,
+  },
+  modalRecursoOpcao: {
+    borderBottomColor: '#393544',
+    borderBottomWidth: 1,
+    minHeight: 44,
+    justifyContent: 'center',
+    paddingHorizontal: 12,
+  },
+  modalRecursoOpcaoTexto: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  feedbackPopup: {
+    alignSelf: 'center',
+    borderRadius: 10,
+    borderWidth: 1,
+    left: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    position: 'absolute',
+    right: 20,
+    top: 14,
+    zIndex: 2,
+  },
+  feedbackPopupSucesso: {
+    backgroundColor: '#166534',
+    borderColor: '#4ADE80',
+  },
+  feedbackPopupCancelado: {
+    backgroundColor: '#991B1B',
+    borderColor: '#EF4444',
+  },
+  feedbackPopupTexto: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  floatingBotaoCasa: {
+    alignItems: 'center',
+    backgroundColor: '#8B5CF6',
+    borderColor: '#C4B5FD',
+    borderRadius: 28,
+    borderWidth: 1,
+    bottom: 72,
+    elevation: 8,
+    height: 56,
+    justifyContent: 'center',
+    left: 20,
+    position: 'absolute',
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    width: 56,
+  },
+  floatingBotaoCasaPressed: {
+    backgroundColor: '#7546DA',
+    transform: [{ scale: 0.94 }],
+  },
+  floatingIconeCasa: {
+    color: '#FFFFFF',
+    fontSize: 28,
+    fontWeight: '900',
+    lineHeight: 32,
   },
 });
