@@ -22,7 +22,7 @@ As telas respeitam áreas seguras com `SafeAreaProvider`/`SafeAreaView`. Modais 
 
 O estado inicial contém as categorias **Fazenda** e **Aventura**, com recursos de exemplo. **Madeira** aparece nas duas para permitir testar que os estoques permanecem separados por categoria. A lista de atividades começa vazia; crie atividades pela interface.
 
-Os dados são mantidos em estado React (`useState`) durante a execução e ainda não são persistidos. Ao reiniciar o aplicativo, os dados voltam aos exemplos iniciais.
+Categorias, recursos e atividades são salvos localmente no dispositivo com AsyncStorage e restaurados ao abrir o aplicativo. Filtros, seleções e formulários são temporários e não são persistidos. Na primeira execução, o app inicia com os dados de demonstração.
 
 ## Tecnologias
 
@@ -31,6 +31,7 @@ Os dados são mantidos em estado React (`useState`) durante a execução e ainda
 - TypeScript
 - React Navigation: `@react-navigation/native` e `@react-navigation/native-stack`
 - `react-native-safe-area-context`
+- `@react-native-async-storage/async-storage` para persistência local
 - `expo-status-bar`
 
 ## Executar

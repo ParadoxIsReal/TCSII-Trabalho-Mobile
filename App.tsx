@@ -1,5 +1,7 @@
 import {StatusBar} from 'expo-status-bar';
-import {useEffect, useRef, useState} from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import {createContext, useContext, useEffect, useRef, useState} from 'react';
+import type {Dispatch, SetStateAction} from 'react';
 import {NavigationContainer} from '@react-navigation/native';
 import {createNativeStackNavigator, NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {SafeAreaProvider, SafeAreaView} from 'react-native-safe-area-context';
@@ -76,30 +78,133 @@ const recursosIniciais: Resource[] = [
   { id: 'teste-5', icon: '%', name: 'Cristal', quantity: 'x7', category: 'Aventura' },
 ];
 
+// Dados do domínio persistidos entre execuções; estado de interface fica fora deste tipo.
+type AppData = {
+  categoryPages: string[][];
+  resources: Resource[];
+  activities: Activity[];
+};
+
+type AppDataContextValue = AppData & {
+  setCategoryPages: Dispatch<SetStateAction<string[][]>>;
+  setResources: Dispatch<SetStateAction<Resource[]>>;
+  setActivities: Dispatch<SetStateAction<Activity[]>>;
+};
+
+// Uma única chave mantém categorias, recursos e atividades sincronizados.
+const APP_DATA_STORAGE_KEY = 'farm-helper-app-data';
+const AppDataContext = createContext<AppDataContextValue | null>(null);
+
+// Mantém os dados compartilhados entre as rotas e centraliza leitura e gravação local.
+function AppDataProvider({children}: {children: React.ReactNode}) {
+  const [categoryPages, setCategoryPages] = useState<string[][]>(categoriasIniciais);
+  const [resources, setResources] = useState<Resource[]>(recursosIniciais);
+  const [activities, setActivities] = useState<Activity[]>([]);
+  const [isLoaded, setIsLoaded] = useState(false);
+
+  useEffect(() => {
+    // Evita atualizar o estado depois que o provider for desmontado durante a leitura.
+    let isMounted = true;
+
+    const loadData = async () => {
+      try {
+        const savedData = await AsyncStorage.getItem(APP_DATA_STORAGE_KEY);
+
+        if (savedData !== null) {
+          // Usa os dados disponíveis e mantém os exemplos para campos ausentes ou inválidos.
+          const parsedData = JSON.parse(savedData) as Partial<AppData>;
+
+          if (Array.isArray(parsedData.categoryPages)) {
+            setCategoryPages(parsedData.categoryPages);
+          }
+          if (Array.isArray(parsedData.resources)) {
+            setResources(parsedData.resources);
+          }
+          if (Array.isArray(parsedData.activities)) {
+            setActivities(parsedData.activities);
+          }
+        }
+      } catch (error) {
+        console.warn('Não foi possível carregar os dados salvos.', error);
+      } finally {
+        if (isMounted) {
+          setIsLoaded(true);
+        }
+      }
+    };
+
+    loadData();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    // Aguarda a hidratação para não sobrescrever dados salvos com os valores iniciais.
+    if (!isLoaded) {
+      return;
+    }
+
+    // Persiste somente listas e categorias, não formulários ou seleções temporárias.
+    const appData: AppData = {categoryPages, resources, activities};
+    AsyncStorage.setItem(APP_DATA_STORAGE_KEY, JSON.stringify(appData)).catch((error) => {
+      console.warn('Não foi possível salvar os dados.', error);
+    });
+  }, [activities, categoryPages, isLoaded, resources]);
+
+  // Não monta a navegação até terminar a leitura do armazenamento local.
+  if (!isLoaded) {
+    return null;
+  }
+
+  return (
+    <AppDataContext.Provider value={{
+      categoryPages,
+      resources,
+      activities,
+      setCategoryPages,
+      setResources,
+      setActivities,
+    }}>
+      {children}
+    </AppDataContext.Provider>
+  );
+}
+
+// Expõe os dados compartilhados para as telas dentro do provider.
+function useAppData() {
+  const appData = useContext(AppDataContext);
+
+  if (appData === null) {
+    throw new Error('useAppData deve ser usado dentro de AppDataProvider.');
+  }
+
+  return appData;
+}
+
 // ==================== Navegador principal ====================
 export default function App() {
   return (
-    // Fornece as métricas de área segura usadas por SafeAreaView em iOS e Android.
-    <SafeAreaProvider>
-      {/* NavigationContainer mantém o estado global da navegação. */}
-      <NavigationContainer>
-        {/* Native Stack troca telas com navegação nativa; headerShown=false oculta o cabeçalho padrão. */}
-        <Stack.Navigator initialRouteName="home" screenOptions={{ headerShown: false }}>
-          <Stack.Screen name="home">
-            {(props) => <AppContent screen="home" navigation={props.navigation} />}
-          </Stack.Screen>
-          <Stack.Screen name="tutorials">
-            {(props) => <AppContent screen="tutorials" navigation={props.navigation} />}
-          </Stack.Screen>
-          <Stack.Screen name="setup">
-            {(props) => <AppContent screen="setup" navigation={props.navigation} />}
-          </Stack.Screen>
-          <Stack.Screen name="tracking">
-            {(props) => <AppContent screen="tracking" navigation={props.navigation} />}
-          </Stack.Screen>
-        </Stack.Navigator>
-      </NavigationContainer>
-    </SafeAreaProvider>
+    <AppDataProvider>
+      <SafeAreaProvider>
+        <NavigationContainer>
+          <Stack.Navigator initialRouteName="home" screenOptions={{ headerShown: false }}>
+            <Stack.Screen name="home">
+              {(props) => <AppContent screen="home" navigation={props.navigation} />}
+            </Stack.Screen>
+            <Stack.Screen name="tutorials">
+              {(props) => <AppContent screen="tutorials" navigation={props.navigation} />}
+            </Stack.Screen>
+            <Stack.Screen name="setup">
+              {(props) => <AppContent screen="setup" navigation={props.navigation} />}
+            </Stack.Screen>
+            <Stack.Screen name="tracking">
+              {(props) => <AppContent screen="tracking" navigation={props.navigation} />}
+            </Stack.Screen>
+          </Stack.Navigator>
+        </NavigationContainer>
+      </SafeAreaProvider>
+    </AppDataProvider>
   );
 }
 
@@ -112,16 +217,21 @@ function AppContent({
   navigation: NativeStackNavigationProp<RootStackParamList>;
 }) {
   // ===== Estado da tela Categorias e recursos =====
-  // Seleção, paginação e valores do modal compartilhado por abas.
-  // useState guarda o valor entre renderizações; chamar o setter atualiza a interface.
+  // Listas persistidas são compartilhadas; seleção, paginação e valores dos modais são locais.
+  const {
+    categoryPages,
+    setCategoryPages,
+    resources,
+    setResources,
+    activities,
+    setActivities,
+  } = useAppData();
   const [categoryPage, setCategoryPage] = useState(0);
-  const [categoryPages, setCategoryPages] = useState<string[][]>(categoriasIniciais);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [entryModalVisible, setEntryModalVisible] = useState(false);
   const [entryModalTab, setEntryModalTab] = useState<'category' | 'resource'>('category');
   const [categoryModalMode, setCategoryModalMode] = useState<'add' | 'edit'>('add');
   const [categoryName, setCategoryName] = useState('');
-  const [resources, setResources] = useState<Resource[]>(recursosIniciais);
   const [resourceModalMode, setResourceModalMode] = useState<'add' | 'edit'>('add');
   const [editingResourceId, setEditingResourceId] = useState<string | null>(null);
   const [resourceName, setResourceName] = useState('');
@@ -131,7 +241,6 @@ function AppContent({
 
   // ===== Estado da tela Atividades =====
   // Lista, detalhe aberto, expansão do estoque e campos de criação/adição.
-  const [activities, setActivities] = useState<Activity[]>([]);
   const [activityDetails, setActivityDetails] = useState<Activity | null>(null);
   const [expandedInventoryResourceId, setExpandedInventoryResourceId] = useState<string | null>(null);
   const [acquiredQuantity, setAcquiredQuantity] = useState('');
