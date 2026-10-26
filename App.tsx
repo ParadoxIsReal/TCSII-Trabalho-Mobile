@@ -1,8 +1,19 @@
 import {StatusBar} from 'expo-status-bar';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import type {NotificationResponse} from 'expo-notifications/build/Notifications.types';
+import {SchedulableTriggerInputTypes} from 'expo-notifications/build/Notifications.types';
+import {
+  addNotificationResponseReceivedListener,
+  clearLastNotificationResponseAsync,
+  getLastNotificationResponseAsync,
+} from 'expo-notifications/build/NotificationsEmitter';
+import {getPermissionsAsync, requestPermissionsAsync} from 'expo-notifications/build/NotificationPermissions';
+import {setNotificationHandler} from 'expo-notifications/build/NotificationsHandler';
+import {scheduleNotificationAsync} from 'expo-notifications/build/scheduleNotificationAsync';
+import {cancelScheduledNotificationAsync} from 'expo-notifications/build/cancelScheduledNotificationAsync';
 import {createContext, useContext, useEffect, useRef, useState} from 'react';
 import type {Dispatch, SetStateAction} from 'react';
-import {NavigationContainer} from '@react-navigation/native';
+import {createNavigationContainerRef, NavigationContainer} from '@react-navigation/native';
 import {createNativeStackNavigator, NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {SafeAreaProvider, SafeAreaView} from 'react-native-safe-area-context';
 import {Animated,FlatList,KeyboardAvoidingView,Modal,  Platform,Pressable,PanResponder,ScrollView,StyleSheet,Text,TextInput,View} from 'react-native';
@@ -16,10 +27,21 @@ type RootStackParamList = {
   home: undefined;
   tutorials: undefined;
   setup: undefined;
-  tracking: undefined;
+  tracking: {idAtividade?: string} | undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
+const referenciaNavegacao = createNavigationContainerRef<RootStackParamList>();
+
+// ===== Configuração para exibir notificações locais com o app aberto =====
+setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
 
 // Cartões da tela inicial: altere título, descrição, etapa e símbolo aqui.
 const actions: Array<{
@@ -48,7 +70,7 @@ const actions: Array<{
     eyebrow: 'ACOMPANHAR',
     titulo: 'Atividades',
     description: 'Veja o que falta e atualize seu estoque rapidamente.',
-    icon: '>',
+    icon: '☑',
   },
 ];
 
@@ -62,9 +84,28 @@ type Resource = {
 };
 
 type Activity = {
+  id: string;
   name: string;
   category: string;
   resources: Array<{ name: string; required: number }>;
+  tempoConstrucaoSegundos: number;
+  terminaConstrucaoEm?: number;
+  idNotificacao?: string;
+};
+
+type AtividadePersistidaLegada = Partial<Activity> & Pick<Activity, 'name' | 'category' | 'resources'> & {
+  activityId?: unknown;
+  constructionTimeSeconds?: unknown;
+  constructionEndsAt?: unknown;
+  notificationId?: unknown;
+};
+
+// ===== Formatação do tempo de construção =====
+const formatarDuracao = (totalSegundos: number) => {
+  const horas = Math.floor(totalSegundos / 3600);
+  const minutos = Math.floor((totalSegundos % 3600) / 60);
+  const segundos = totalSegundos % 60;
+  return [horas, minutos, segundos].map((parte) => String(parte).padStart(2, '0')).join(':');
 };
 
 // ==================== Dados iniciais para testes ====================
@@ -121,7 +162,37 @@ function AppDataProvider({children}: {children: React.ReactNode}) {
             setResources(parsedData.resources);
           }
           if (Array.isArray(parsedData.activities)) {
-            setActivities(parsedData.activities);
+            // Migra campos antigos em inglês para o formato atual sem perder construções em andamento.
+            setActivities(parsedData.activities.map((atividade, indice) => {
+              const atividadeLegada = atividade as AtividadePersistidaLegada;
+              const tempoSalvo = atividadeLegada.tempoConstrucaoSegundos
+                ?? atividadeLegada.constructionTimeSeconds;
+              const fimConstrucaoSalvo = atividadeLegada.terminaConstrucaoEm
+                ?? atividadeLegada.constructionEndsAt;
+              const idNotificacaoSalvo = atividadeLegada.idNotificacao
+                ?? atividadeLegada.notificationId;
+
+              return {
+                id: typeof atividadeLegada.id === 'string' && atividadeLegada.id.length > 0
+                  ? atividadeLegada.id
+                  : `legacy-${indice}-${atividadeLegada.name}`,
+                name: atividadeLegada.name,
+                category: atividadeLegada.category,
+                resources: atividadeLegada.resources,
+                tempoConstrucaoSegundos: typeof tempoSalvo === 'number'
+                  && Number.isSafeInteger(tempoSalvo)
+                  && tempoSalvo >= 0
+                  ? tempoSalvo
+                  : 0,
+                terminaConstrucaoEm: typeof fimConstrucaoSalvo === 'number'
+                  && Number.isSafeInteger(fimConstrucaoSalvo)
+                  ? fimConstrucaoSalvo
+                  : undefined,
+                idNotificacao: typeof idNotificacaoSalvo === 'string'
+                  ? idNotificacaoSalvo
+                  : undefined,
+              };
+            }));
           }
         }
       } catch (error) {
@@ -184,10 +255,49 @@ function useAppData() {
 
 // ==================== Navegador principal ====================
 export default function App() {
+  const [navegacaoPronta, setNavegacaoPronta] = useState(false);
+  const [idAtividadePendente, setIdAtividadePendente] = useState<string | null>(null);
+
+  // ===== Abertura de atividade a partir de uma notificação =====
+  useEffect(() => {
+    const tratarRespostaNotificacao = (resposta: NotificationResponse) => {
+      const dadosNotificacao = resposta.notification.request.content.data;
+      const idAtividade = dadosNotificacao?.idAtividade ?? dadosNotificacao?.activityId;
+      if (typeof idAtividade === 'string') {
+        setIdAtividadePendente(idAtividade);
+      }
+    };
+    const inscricaoRespostaNotificacao = addNotificationResponseReceivedListener(tratarRespostaNotificacao);
+
+    getLastNotificationResponseAsync()
+      .then((resposta) => {
+        if (resposta !== null) {
+          tratarRespostaNotificacao(resposta);
+          return clearLastNotificationResponseAsync();
+        }
+        return undefined;
+      })
+      .catch((erro: unknown) => {
+        console.warn('Não foi possível recuperar a abertura pela notificação.', erro);
+      });
+
+    return () => inscricaoRespostaNotificacao.remove();
+  }, []);
+
+  // Aguarda o navegador ficar pronto antes de abrir a rota recebida.
+  useEffect(() => {
+    if (!navegacaoPronta || idAtividadePendente === null) {
+      return;
+    }
+
+    referenciaNavegacao.navigate('tracking', {idAtividade: idAtividadePendente});
+    setIdAtividadePendente(null);
+  }, [navegacaoPronta, idAtividadePendente]);
+
   return (
     <AppDataProvider>
       <SafeAreaProvider>
-        <NavigationContainer>
+        <NavigationContainer ref={referenciaNavegacao} onReady={() => setNavegacaoPronta(true)}>
           <Stack.Navigator initialRouteName="home" screenOptions={{ headerShown: false }}>
             <Stack.Screen name="home">
               {(props) => <AppContent screen="home" navigation={props.navigation} />}
@@ -199,7 +309,13 @@ export default function App() {
               {(props) => <AppContent screen="setup" navigation={props.navigation} />}
             </Stack.Screen>
             <Stack.Screen name="tracking">
-              {(props) => <AppContent screen="tracking" navigation={props.navigation} />}
+              {(props) => (
+                <AppContent
+                  screen="tracking"
+                  idAtividade={props.route.params?.idAtividade}
+                  navigation={props.navigation}
+                />
+              )}
             </Stack.Screen>
           </Stack.Navigator>
         </NavigationContainer>
@@ -211,9 +327,11 @@ export default function App() {
 // ==================== Estado, regras e telas ====================
 function AppContent({
   screen,
+  idAtividade,
   navigation,
 }: {
   screen: Screen;
+  idAtividade?: string;
   navigation: NativeStackNavigationProp<RootStackParamList>;
 }) {
   // ===== Estado da tela Categorias e recursos =====
@@ -229,6 +347,7 @@ function AppContent({
   const [categoryPage, setCategoryPage] = useState(0);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [entryModalVisible, setEntryModalVisible] = useState(false);
+  const [confirmacaoLimpezaRecursosVisivel, setConfirmacaoLimpezaRecursosVisivel] = useState(false);
   const [entryModalTab, setEntryModalTab] = useState<'category' | 'resource'>('category');
   const [categoryModalMode, setCategoryModalMode] = useState<'add' | 'edit'>('add');
   const [categoryName, setCategoryName] = useState('');
@@ -242,6 +361,11 @@ function AppContent({
   // ===== Estado da tela Atividades =====
   // Lista, detalhe aberto, expansão do estoque e campos de criação/adição.
   const [activityDetails, setActivityDetails] = useState<Activity | null>(null);
+  // Campos e relógio usados pelo cadastro e acompanhamento das construções.
+  const [horasConstrucao, setHorasConstrucao] = useState('');
+  const [minutosConstrucao, setMinutosConstrucao] = useState('');
+  const [segundosConstrucao, setSegundosConstrucao] = useState('');
+  const [horarioAtual, setHorarioAtual] = useState(Date.now());
   const [expandedInventoryResourceId, setExpandedInventoryResourceId] = useState<string | null>(null);
   const [acquiredQuantity, setAcquiredQuantity] = useState('');
   const [activityModalVisible, setActivityModalVisible] = useState(false);
@@ -254,6 +378,7 @@ function AppContent({
   const [selectedActivityResources, setSelectedActivityResources] = useState<Activity['resources']>([]);
   const [feedback, setFeedback] = useState<{ mensagem: string; tipo: 'sucesso' | 'cancelado' } | null>(null);
   const [categoryBoxWidth, setCategoryBoxWidth] = useState(0);
+  const idsAtividadesIniciando = useRef(new Set<string>());
   // useRef preserva referências mutáveis sem provocar uma nova renderização.
   const categoryPageRef = useRef(categoryPage);
   const categoryPagesRef = useRef(categoryPages);
@@ -273,6 +398,38 @@ function AppContent({
     const timeout = setTimeout(() => setFeedback(null), 2600); // Numero 2600 é quanto ms fica visivel o aviso
     return () => clearTimeout(timeout); // Limpa o timer ao desmontar ou quando feedback muda.
   }, [feedback]);
+
+  // Abre o detalhe solicitado pela notificação e consome o parâmetro da rota.
+  useEffect(() => {
+    if (screen !== 'tracking' || idAtividade === undefined) {
+      return;
+    }
+
+    const atividade = activities.find((item) => item.id === idAtividade);
+    if (atividade !== undefined) {
+      setActivityDetails(atividade);
+      setExpandedInventoryResourceId(null);
+      setAcquiredQuantity('');
+    }
+    navigation.setParams({idAtividade: undefined});
+  }, [activities, idAtividade, navigation, screen]);
+
+  // Atualiza a contagem regressiva somente enquanto a tela de atividades está aberta.
+  useEffect(() => {
+    if (screen !== 'tracking') {
+      return undefined;
+    }
+
+    const hasRunningConstruction = activities.some((activity) => (
+      activity.terminaConstrucaoEm !== undefined && activity.terminaConstrucaoEm > Date.now()
+    ));
+    if (!hasRunningConstruction) {
+      return undefined;
+    }
+
+    const timer = setInterval(() => setHorarioAtual(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [activities, screen]);
 
   // ===== Modal de categoria: abrir, fechar, criar e renomear =====
   const openCategoryModal = (mode: 'add' | 'edit') => {
@@ -360,6 +517,9 @@ function AppContent({
       .map((page) => page.filter((category) => category !== categoryToDelete))
       .filter((page) => page.length > 0);
     const nextPage = Math.min(categoryPage, Math.max(updatedPages.length - 1, 0));
+    activities
+      .filter((activity) => activity.category === categoryToDelete)
+      .forEach(cancelarNotificacaoAtividade);
 
     setCategoryPages(updatedPages);
     setCategoryPage(nextPage);
@@ -381,6 +541,11 @@ function AppContent({
     // IDs removem os registros exatos; categoria + nome preserva recursos homônimos de outros jogos.
     const resourceIdsToDelete = new Set(resourcesToDelete.map((resource) => resource.id));
     const resourceKeysToDelete = new Set(resourcesToDelete.map((resource) => `${resource.category}\u0000${resource.name}`));
+    activities
+      .filter((activity) => (
+        activity.resources.some((resource) => resourceKeysToDelete.has(`${activity.category}\u0000${resource.name}`))
+      ))
+      .forEach(cancelarNotificacaoAtividade);
 
     setResources((currentResources) => currentResources.filter((resource) => !resourceIdsToDelete.has(resource.id)));
     setActivities((currentActivities) => currentActivities.filter((activity) => (
@@ -391,12 +556,17 @@ function AppContent({
     deleteResources([resource]);
     setFeedback({ mensagem: 'Recurso e atividades associadas excluídos', tipo: 'sucesso' });
   };
-  // Limpar respeita o filtro atual: remove a categoria selecionada ou o estoque inteiro.
-  const clearResourceList = () => {
+  // ===== Limpeza dos recursos visíveis com confirmação =====
+  const limparListaRecursos = () => {
     if (visibleResources.length === 0) {
       return;
     }
 
+    setConfirmacaoLimpezaRecursosVisivel(true);
+  };
+  // Executa a exclusão somente depois da confirmação explícita.
+  const confirmarLimpezaListaRecursos = () => {
+    setConfirmacaoLimpezaRecursosVisivel(false);
     deleteResources(visibleResources);
     setFeedback({ mensagem: 'Recursos visíveis e atividades associadas excluídos', tipo: 'sucesso' });
   };
@@ -488,6 +658,9 @@ function AppContent({
   const openActivityModal = () => {
     setActivityName('');
     setActivityCategory(selectedCategory ?? categoryPages[0]?.[0] ?? '');
+    setHorasConstrucao('');
+    setMinutosConstrucao('');
+    setSegundosConstrucao('');
     setActivityCategoryDropdownOpen(false);
     setActivityResourceName('');
     setActivityResourceQuantity('');
@@ -499,6 +672,9 @@ function AppContent({
     setActivityModalVisible(false);
     setActivityName('');
     setActivityCategory('');
+    setHorasConstrucao('');
+    setMinutosConstrucao('');
+    setSegundosConstrucao('');
     setActivityCategoryDropdownOpen(false);
     setActivityResourceName('');
     setActivityResourceQuantity('');
@@ -537,32 +713,164 @@ function AppContent({
   };
   const saveActivity = () => {
     const trimmedName = activityName.trim();
+    const horas = Number(horasConstrucao);
+    const minutos = Number(minutosConstrucao);
+    const segundos = Number(segundosConstrucao);
+    // Horas aceitam até dois dígitos; minutos e segundos seguem o padrão de relógio.
+    const tempoConstrucaoValido = (
+      Number.isInteger(horas) && horas >= 0 && horas <= 99
+      && Number.isInteger(minutos) && minutos >= 0 && minutos <= 59
+      && Number.isInteger(segundos) && segundos >= 0 && segundos <= 59
+    );
 
-    if (trimmedName.length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0) {
+    if (
+      trimmedName.length === 0
+      || activityCategory.length === 0
+      || selectedActivityResources.length === 0
+      || !tempoConstrucaoValido
+    ) {
       return;
     }
 
+    const tempoConstrucaoSegundos = horas * 3600 + minutos * 60 + segundos;
     setActivities((currentActivities) => [
       ...currentActivities,
       {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
         name: trimmedName,
         category: activityCategory,
         resources: selectedActivityResources,
+        tempoConstrucaoSegundos,
       },
     ]);
     closeActivityModal(false);
     setFeedback({ mensagem: 'Atividade adicionada com sucesso', tipo: 'sucesso' });
   };
-  // ===== Detalhe da atividade e estoque atual =====
+  // ===== Detalhe, estoque e ciclo de construção da atividade =====
   // A busca usa categoria + nome para não misturar recursos homônimos.
   const getAvailableResourceQuantity = (category: string, name: string) => {
     const resource = resources.find((item) => item.category === category && item.name === name);
     return Number(resource?.quantity.replace(/^x/, '') ?? 0);
   };
+  const detalhesAtividadeConcluidos = activityDetails !== null && activityDetails.resources.every((item) => (
+    getAvailableResourceQuantity(activityDetails.category, item.name) >= item.required
+  ));
   const closeActivityDetails = () => {
     setActivityDetails(null);
     setExpandedInventoryResourceId(null);
     setAcquiredQuantity('');
+  };
+  // Inicia a construção imediatamente; a notificação é complementar ao temporizador.
+  const iniciarConstrucaoAtividade = async () => {
+    if (
+      activityDetails === null
+      || activityDetails.terminaConstrucaoEm !== undefined
+      || idsAtividadesIniciando.current.has(activityDetails.id)
+    ) {
+      return;
+    }
+
+    const atividadeParaIniciar = activityDetails;
+    idsAtividadesIniciando.current.add(atividadeParaIniciar.id);
+    try {
+      const temRecursosSuficientes = atividadeParaIniciar.resources.every((item) => (
+        getAvailableResourceQuantity(atividadeParaIniciar.category, item.name) >= item.required
+      ));
+      if (!temRecursosSuficientes) {
+        setFeedback({mensagem: 'Ainda faltam recursos para concluir esta atividade.', tipo: 'cancelado'});
+        return;
+      }
+
+      const inicioEm = Date.now();
+      const terminaConstrucaoEm = inicioEm + atividadeParaIniciar.tempoConstrucaoSegundos * 1000;
+
+      setResources((currentResources) => currentResources.map((resource) => {
+        if (resource.category !== atividadeParaIniciar.category) {
+          return resource;
+        }
+        const required = atividadeParaIniciar.resources.find((item) => item.name === resource.name)?.required;
+        if (required === undefined) {
+          return resource;
+        }
+        return {
+          ...resource,
+          quantity: `x${Number(resource.quantity.replace(/^x/, '')) - required}`,
+        };
+      }));
+
+      const atividadeAtualizada = {...atividadeParaIniciar, terminaConstrucaoEm};
+      setActivities((currentActivities) => currentActivities.map((activity) => (
+        activity.id === atividadeAtualizada.id ? atividadeAtualizada : activity
+      )));
+      setActivityDetails(atividadeAtualizada);
+      setHorarioAtual(inicioEm);
+      setFeedback({mensagem: 'Atividade confirmada; construção iniciada.', tipo: 'sucesso'});
+
+      if (atividadeParaIniciar.tempoConstrucaoSegundos > 0) {
+        try {
+          const permissoesAtuais = await getPermissionsAsync();
+          const permissoes = permissoesAtuais.granted
+            ? permissoesAtuais
+            : await requestPermissionsAsync();
+          if (!permissoes.granted) {
+            setFeedback({
+              mensagem: 'Construção iniciada, mas notificações estão desativadas.',
+              tipo: 'cancelado',
+            });
+            return;
+          }
+
+          const idNotificacao = await scheduleNotificationAsync({
+            content: {
+              title: 'Construção concluída',
+              body: `${atividadeParaIniciar.name} está pronta para coletar.`,
+              data: {idAtividade: atividadeParaIniciar.id},
+            },
+            trigger: {
+              type: SchedulableTriggerInputTypes.TIME_INTERVAL,
+              seconds: Math.max(1, Math.ceil((terminaConstrucaoEm - Date.now()) / 1000)),
+            },
+          });
+          setActivities((currentActivities) => currentActivities.map((activity) => (
+            activity.id === atividadeParaIniciar.id
+              ? {...activity, idNotificacao}
+              : activity
+          )));
+          setActivityDetails((currentActivity) => (
+            currentActivity?.id === atividadeParaIniciar.id
+              ? {...currentActivity, idNotificacao}
+              : currentActivity
+          ));
+        } catch (error) {
+          console.warn('Não foi possível agendar a notificação da atividade.', error);
+          setFeedback({
+            mensagem: `Construção iniciada, mas a notificação falhou: ${error instanceof Error ? error.message : String(error)}`,
+            tipo: 'cancelado',
+          });
+        }
+      }
+    } finally {
+      idsAtividadesIniciando.current.delete(atividadeParaIniciar.id);
+    }
+  };
+  // Remove a atividade pronta e cancela qualquer aviso que ainda esteja agendado.
+  const coletarAtividade = () => {
+    if (activityDetails === null || activityDetails.terminaConstrucaoEm === undefined || activityDetails.terminaConstrucaoEm > Date.now()) {
+      return;
+    }
+
+    cancelarNotificacaoAtividade(activityDetails);
+    setActivities((currentActivities) => currentActivities.filter((activity) => activity.id !== activityDetails.id));
+    closeActivityDetails();
+    setFeedback({mensagem: 'Atividade coletada e removida.', tipo: 'sucesso'});
+  };
+  const cancelarNotificacaoAtividade = (atividade: Activity) => {
+    if (atividade.idNotificacao === undefined) {
+      return;
+    }
+    cancelScheduledNotificationAsync(atividade.idNotificacao).catch((erro: unknown) => {
+      console.warn('Não foi possível cancelar a notificação da atividade removida.', erro);
+    });
   };
   // Soma unidades adquiridas ao recurso do inventário ligado à atividade atual.
   const addAcquiredQuantity = (name: string) => {
@@ -747,20 +1055,20 @@ function AppContent({
                   {/* título e explicação da etapa */}
                   <Text style={styles.tituloEtapaTutorial}>Crie e acompanhe atividades</Text>
                   <Text style={styles.descricaoEtapaTutorial}>
-                    Na página Atividades, toque em ⊕ para criar uma meta, escolher a categoria e definir quanto precisa de cada recurso. Toque na atividade para ver todos os itens; use + na linha de um recurso para informar as unidades recebidas. O estoque e o progresso são atualizados automaticamente.
+                    Em Atividades, toque em ⊕ para escolher a categoria, adicionar os recursos necessários e definir o tempo de construção em HH:MM:SS. Use + nos detalhes para registrar recursos que reuniu. Quando todos os itens estiverem completos, toque em Confirmar: as quantidades são descontadas do estoque e a construção começa. Ao terminar, receba uma notificação que abre a atividade; toque em Coletar para removê-la. Com 00:00:00, a atividade fica pronta para coletar imediatamente.
                   </Text>
-                  {/* exemplo de atividade, status e progresso dos recursos */}
+                  {/* exemplo visual de atividade pronta para iniciar a construção */}
                   <View style={[styles.superficie, styles.exemploAtividadeTutorial]}>
                     <View style={styles.cabecalhoAtividadeTutorial}>
                       <View>
                         <Text style={styles.nomeAtividadeTutorial}>Construir celeiro</Text>
                         <Text style={styles.categoriaAtividadeTutorial}>catg1</Text>
                       </View>
-                      <Text style={styles.situacaoAtividadeTutorial}>PENDENTE</Text>
+                      <Text style={styles.situacaoAtividadeTutorial}>CONCLUÍDA</Text>
                     </View>
                     <View style={styles.linhaRecursoAtividadeTutorial}>
-                      <Text style={styles.textoRecursoTutorial}>Ferro</Text>
-                      <Text style={styles.quantidadeMetaTutorial}>4/12</Text>
+                      <Text style={[styles.textoRecursoTutorial, styles.textoConcluidoRiscado]}>Ferro</Text>
+                      <Text style={[styles.quantidadeMetaTutorial, styles.textoQuantidadeConcluida]}>12/12</Text>
                       <View style={styles.acaoAdicionarTutorial}>
                         <Text style={styles.textoAcaoAdicionarTutorial}>+</Text>
                       </View>
@@ -772,7 +1080,17 @@ function AppContent({
                         <Text style={styles.textoAcaoAdicionarTutorial}>+</Text>
                       </View>
                     </View>
+                    <View style={styles.tempoConstrucaoTutorial}>
+                      <Text style={styles.rotuloTempoConstrucaoTutorial}>TEMPO DE CONSTRUÇÃO</Text>
+                      <Text style={styles.valorTempoConstrucaoTutorial}>00:30:00</Text>
+                    </View>
+                    <View style={styles.botaoConstrucaoTutorial}>
+                      <Text style={styles.textoBotaoConstrucaoTutorial}>Confirmar</Text>
+                    </View>
                   </View>
+                  <Text style={styles.descricaoPosAtividadeTutorial}>
+                    Depois de confirmar: CONSTRUINDO → notificação ao terminar → Coletar.
+                  </Text>
                 </View>
               </View>
             </View>
@@ -780,7 +1098,7 @@ function AppContent({
             {/* dica resumida sobre categoria, estoque e atividades */}
             <View style={styles.dicaTutorial}>
               <Text style={styles.iconeDicaTutorial}>i</Text>
-              <Text style={styles.textoDicaTutorial}>O estoque pertence à categoria. Ao registrar unidades em uma atividade, todas as metas ligadas ao mesmo recurso acompanham a mudança.</Text>
+              <Text style={styles.textoDicaTutorial}>O estoque é separado por categoria. Confirmar uma construção consome os recursos necessários; a notificação depende da permissão do telefone.</Text>
             </View>
             {/* Modal de demonstração desativado nesta tela; o cadastro real fica em Atividades. */}
             <Modal
@@ -798,7 +1116,7 @@ function AppContent({
                     <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} style={styles.conteudoComAlturaLimitada}>
                       {/* campo para digitar o nome da atividade */}
                       <TextInput
-                        accessibilityLabel="Nome da atividade"
+                        accessibilityLabel="Nome da atividade, obrigatório"
                         autoFocus
                         maxLength={32}
                         onChangeText={setActivityName}
@@ -808,11 +1126,15 @@ function AppContent({
                         value={activityName}
                       />
                       {/* seletor da categoria da atividade */}
+                      <Text style={styles.rotuloCampoModal}>
+                          Categoria<Text style={styles.asteriscoObrigatorio}> *</Text>
+                      </Text>
                       <Pressable
+                        accessibilityLabel="Categoria, obrigatório"
                         accessibilityRole="button"
                         accessibilityState={{ expanded: activityCategoryDropdownOpen }}
                         onPress={() => setActivityCategoryDropdownOpen((isOpen) => !isOpen)}
-                        style={({ pressed }) => [styles.seletorRecursoModal, pressed && styles.botaoPressionado]}
+                        style={({ pressed }) => [styles.seletorRecursoModal, styles.seletorAposRotulo, pressed && styles.botaoPressionado]}
                       >
                         <Text style={styles.textoSeletorRecursoModal}>{activityCategory || 'Escolha uma categoria'}</Text>
                         <Text style={styles.setaSeletorRecursoModal}>{activityCategoryDropdownOpen ? '^' : 'v'}</Text>
@@ -822,6 +1144,7 @@ function AppContent({
                         <View style={styles.opcoesRecursoModal}>
                           {resourceCategoryOptions.map((category) => (
                             <Pressable
+                              accessibilityLabel="Categoria, obrigatório"
                               accessibilityRole="button"
                               key={category}
                               onPress={() => changeActivityCategory(category)}
@@ -833,6 +1156,14 @@ function AppContent({
                         </View>
                       )}
                       {/* seletor do recurso e quantidade necessária */}
+                      <View style={styles.rotulosEntradaModalAtividade}>
+                        <Text style={[styles.rotuloCampoModal, styles.rotuloSeletorRecurso]}>
+                          Recurso<Text style={styles.asteriscoObrigatorio}> *</Text>
+                        </Text>
+                        <Text style={[styles.rotuloCampoModal, styles.rotuloQuantidadeRecurso]}>
+                          Quantidade<Text style={styles.asteriscoObrigatorio}> *</Text>
+                        </Text>
+                      </View>
                       <View style={styles.linhaEntradaModalAtividade}>
                         <Pressable
                           accessibilityRole="button"
@@ -844,7 +1175,7 @@ function AppContent({
                           <Text style={styles.setaSeletorRecursoModal}>{activityResourceDropdownOpen ? '^' : 'v'}</Text>
                         </Pressable>
                         <TextInput
-                          accessibilityLabel="Quantidade necessária"
+                          accessibilityLabel="Quantidade necessária, obrigatório"
                           keyboardType="numeric"
                           maxLength={9}
                           onChangeText={(value) => setActivityResourceQuantity(value.replace(/[^0-9]/g, ''))}
@@ -857,19 +1188,26 @@ function AppContent({
                       {/* recursos disponíveis dentro da categoria escolhida */}
                       {activityResourceDropdownOpen && (
                         <View style={styles.opcoesRecursoModal}>
-                          {activityResourceOptions.map((resource) => (
-                            <Pressable
-                              accessibilityRole="button"
-                              key={resource.id}
-                              onPress={() => {
-                                setActivityResourceName(resource.name);
-                                setActivityResourceDropdownOpen(false);
-                              }}
-                              style={({ pressed }) => [styles.opcaoRecursoModal, pressed && styles.botaoPressionado]}
-                            >
-                              <Text style={styles.textoOpcaoRecursoModal}>{resource.name}</Text>
-                            </Pressable>
-                          ))}
+                          <ScrollView
+                            keyboardShouldPersistTaps="handled"
+                            nestedScrollEnabled
+                            showsVerticalScrollIndicator={false}
+                            style={styles.listaOpcoesRecursoModal}
+                          >
+                            {activityResourceOptions.map((resource) => (
+                              <Pressable
+                                accessibilityRole="button"
+                                key={resource.id}
+                                onPress={() => {
+                                  setActivityResourceName(resource.name);
+                                  setActivityResourceDropdownOpen(false);
+                                }}
+                                style={({ pressed }) => [styles.opcaoRecursoModal, pressed && styles.botaoPressionado]}
+                              >
+                                <Text style={styles.textoOpcaoRecursoModal}>{resource.name}</Text>
+                              </Pressable>
+                            ))}
+                          </ScrollView>
                           {activityResourceOptions.length === 0 && <Text style={styles.mensagemVaziaModalAtividade}>Todos os recursos desta categoria já foram adicionados.</Text>}
                         </View>
                       )}
@@ -916,11 +1254,11 @@ function AppContent({
                       </Pressable>
                       <Pressable
                         accessibilityRole="button"
-                        disabled={activityName.trim().length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0}
+                        disabled={activityName.trim().length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0 || Number(minutosConstrucao) > 59 || Number(segundosConstrucao) > 59}
                         onPress={saveActivity}
                         style={({ pressed }) => [
                           styles.botaoModalCadastro,
-                          (activityName.trim().length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0) && styles.toolbarBotaoDesabilitado,
+                          (activityName.trim().length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0 || Number(minutosConstrucao) > 59 || Number(segundosConstrucao) > 59) && styles.toolbarBotaoDesabilitado,
                           pressed && styles.botaoPressionado,
                         ]}
                       >
@@ -968,7 +1306,7 @@ function AppContent({
                 <Text style={styles.atividadesVazio}>Nenhuma atividade cadastrada.</Text>
               )}
               {/* cartões com nome, categoria, status e progresso de cada atividade */}
-              {activities.map((activity, activityIndex) => {
+              {activities.map((activity) => {
                 const activityResources = activity.resources.map((activityResource) => {
                   return {
                     ...activityResource,
@@ -976,7 +1314,17 @@ function AppContent({
                   };
                 });
                 const completedCount = activityResources.filter((resource) => resource.current >= resource.required).length;
-                const activityIsComplete = completedCount === activityResources.length;
+                const atividadeConcluida = completedCount === activityResources.length;
+                const estaConstruindo = activity.terminaConstrucaoEm !== undefined && activity.terminaConstrucaoEm > horarioAtual;
+                const prontaParaColeta = activity.terminaConstrucaoEm !== undefined && !estaConstruindo;
+                const segundosRestantesConstrucao = activity.terminaConstrucaoEm === undefined
+                  ? 0
+                  : Math.ceil((activity.terminaConstrucaoEm - horarioAtual) / 1000);
+                const rotuloStatus = estaConstruindo
+                  ? 'CONSTRUINDO'
+                  : prontaParaColeta
+                    ? 'PRONTA'
+                    : atividadeConcluida ? 'CONCLUIDA' : 'PENDENTE';
                 const hiddenResourceCount = Math.max(activityResources.length - 3, 0);
 
                 return (
@@ -984,7 +1332,7 @@ function AppContent({
                   <Pressable
                     accessibilityRole="button"
                     accessibilityLabel={`Abrir atividade ${activity.name}`}
-                    key={`${activity.name}-${activityIndex}`}
+                    key={activity.id}
                     onPress={() => setActivityDetails(activity)}
                     style={({ pressed }) => [styles.superficie, styles.cartaoAtividade, pressed && styles.cartaoAtividadePressionado]}
                   >
@@ -993,14 +1341,31 @@ function AppContent({
                         {/* nome e categoria da atividade */}
                         <Text style={styles.nomeAtividade}>{activity.name}</Text>
                         <Text style={styles.categoriaAtividade}>{activity.category}</Text>
+                        <Text style={styles.tempoConstrucaoAtividade}>
+                          Tempo: {formatarDuracao(activity.tempoConstrucaoSegundos ?? 0)}
+                        </Text>
                       </View>
-                      <View style={[styles.situacaoAtividade, activityIsComplete ? styles.situacaoAtividadeConcluida : styles.situacaoAtividadePendente]}>
-                        {/* texto do status: PENDENTE ou CONCLUIDA */}
-                        <Text style={[styles.textoSituacaoAtividade, activityIsComplete ? styles.textoSituacaoConcluida : styles.textoSituacaoPendente]}>
-                          {activityIsComplete ? 'CONCLUIDA' : 'PENDENTE'}
+                      <View style={[
+                        styles.situacaoAtividade,
+                        estaConstruindo ? styles.situacaoAtividadeConstruindo : prontaParaColeta || atividadeConcluida
+                          ? styles.situacaoAtividadeConcluida
+                          : styles.situacaoAtividadePendente,
+                      ]}>
+                        <Text style={[
+                          styles.textoSituacaoAtividade,
+                          estaConstruindo ? styles.textoSituacaoConstruindo : prontaParaColeta || atividadeConcluida
+                            ? styles.textoSituacaoConcluida
+                            : styles.textoSituacaoPendente,
+                        ]}>
+                          {rotuloStatus}
                         </Text>
                       </View>
                     </View>
+                    {estaConstruindo && (
+                      <Text style={styles.contadorConstrucao}>
+                        Tempo restante: {formatarDuracao(segundosRestantesConstrucao)}
+                      </Text>
+                    )}
 
                     <View style={styles.listaRecursosAtividade}>
                       {/* até três recursos aparecem no cartão; os demais são resumidos abaixo */}
@@ -1045,14 +1410,26 @@ function AppContent({
               {/* KeyboardAvoidingView ajusta o conteúdo quando o teclado virtual aparece. */}
               <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.espacoFlexivel}>
                 <View style={styles.fundoModal}>
+                  <Pressable
+                    accessibilityLabel="Cancelar criação da atividade"
+                    accessibilityRole="button"
+                    onPress={() => closeActivityModal()}
+                    style={StyleSheet.absoluteFill}
+                  />
                   <View style={styles.modalCadastro}>
                     {/* título do modal de criação */}
                     <Text style={styles.tituloModalCadastro}>Nova atividade</Text>
                     <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} style={styles.conteudoComAlturaLimitada}>
                       {/* campo de nome: placeholder e limite de caracteres */}
-                      <TextInput accessibilityLabel="Nome da atividade" autoFocus maxLength={32} onChangeText={setActivityName} placeholder="Nome da atividade" placeholderTextColor="#B8B4C6" style={styles.campoModalCadastro} value={activityName} />
+                      <Text style={styles.rotuloCampoModal}>
+                        Nome da atividade<Text style={styles.asteriscoObrigatorio}> *</Text>
+                      </Text>
+                      <TextInput accessibilityLabel="Nome da atividade, obrigatório" autoFocus maxLength={32} onChangeText={setActivityName} placeholder="Nome da atividade" placeholderTextColor="#B8B4C6" style={styles.campoModalCadastro} value={activityName} />
                       {/* seletor de categoria e opções disponíveis */}
-                      <Pressable accessibilityRole="button" accessibilityState={{ expanded: activityCategoryDropdownOpen }} onPress={() => setActivityCategoryDropdownOpen((isOpen) => !isOpen)} style={({ pressed }) => [styles.seletorRecursoModal, pressed && styles.botaoPressionado]}>
+                      <Text style={styles.rotuloCampoModal}>
+                      Categoria<Text style={styles.asteriscoObrigatorio}> *</Text>
+                      </Text>
+                      <Pressable accessibilityLabel="Categoria, obrigatório" accessibilityRole="button" accessibilityState={{ expanded: activityCategoryDropdownOpen }} onPress={() => setActivityCategoryDropdownOpen((isOpen) => !isOpen)} style={({ pressed }) => [styles.seletorRecursoModal, styles.seletorAposRotulo, pressed && styles.botaoPressionado]}>
                         <Text style={styles.textoSeletorRecursoModal}>{activityCategory || 'Escolha uma categoria'}</Text>
                         <Text style={styles.setaSeletorRecursoModal}>{activityCategoryDropdownOpen ? '^' : 'v'}</Text>
                       </Pressable>
@@ -1066,21 +1443,44 @@ function AppContent({
                         </View>
                       )}
                       {/* seletor de recurso e campo da quantidade necessária */}
+                      <View style={styles.rotulosEntradaModalAtividade}>
+                        <Text style={[styles.rotuloCampoModal, styles.rotuloSeletorRecurso]}>
+                          Recurso<Text style={styles.asteriscoObrigatorio}> *</Text>
+                        </Text>
+                        <Text style={[styles.rotuloCampoModal, styles.rotuloQuantidadeRecurso]}>
+                          Quantidade<Text style={styles.asteriscoObrigatorio}> *</Text>
+                        </Text>
+                      </View>
                       <View style={styles.linhaEntradaModalAtividade}>
-                        <Pressable accessibilityRole="button" accessibilityState={{ expanded: activityResourceDropdownOpen }} onPress={() => setActivityResourceDropdownOpen((isOpen) => !isOpen)} style={({ pressed }) => [styles.seletorRecursoModal, styles.seletorRecursoModalAtividade, pressed && styles.botaoPressionado]}>
+                        <Pressable accessibilityLabel="Recurso, obrigatório" accessibilityRole="button" accessibilityState={{ expanded: activityResourceDropdownOpen }} onPress={() => setActivityResourceDropdownOpen((isOpen) => !isOpen)} style={({ pressed }) => [styles.seletorRecursoModal, styles.seletorRecursoModalAtividade, pressed && styles.botaoPressionado]}>
                           <Text style={styles.textoSeletorRecursoModal} numberOfLines={1}>{activityResourceName || 'Escolha o recurso'}</Text>
                           <Text style={styles.setaSeletorRecursoModal}>{activityResourceDropdownOpen ? '^' : 'v'}</Text>
                         </Pressable>
                         {/* teclado, placeholder e limite da quantidade necessária */}
-                        <TextInput accessibilityLabel="Quantidade necessária" keyboardType="numeric" maxLength={9} onChangeText={(value) => setActivityResourceQuantity(value.replace(/[^0-9]/g, ''))} placeholder="Qtd." placeholderTextColor="#B8B4C6" style={styles.quantidadeModalAtividade} value={activityResourceQuantity} />
+                        <TextInput accessibilityLabel="Quantidade necessária, obrigatório" keyboardType="numeric" maxLength={9} onChangeText={(value) => setActivityResourceQuantity(value.replace(/[^0-9]/g, ''))} placeholder="Qtd." placeholderTextColor="#B8B4C6" style={styles.quantidadeModalAtividade} value={activityResourceQuantity} />
                       </View>
                       {activityResourceDropdownOpen && (
                         <View style={styles.opcoesRecursoModal}>
-                          {activityResourceOptions.map((resource) => (
-                            <Pressable accessibilityRole="button" key={resource.id} onPress={() => { setActivityResourceName(resource.name); setActivityResourceDropdownOpen(false); }} style={({ pressed }) => [styles.opcaoRecursoModal, pressed && styles.botaoPressionado]}>
-                              <Text style={styles.textoOpcaoRecursoModal}>{resource.name}</Text>
-                            </Pressable>
-                          ))}
+                          <ScrollView
+                            keyboardShouldPersistTaps="handled"
+                            nestedScrollEnabled
+                            showsVerticalScrollIndicator={false}
+                            style={styles.listaOpcoesRecursoModal}
+                          >
+                            {activityResourceOptions.map((resource) => (
+                              <Pressable
+                                accessibilityRole="button"
+                                key={resource.id}
+                                onPress={() => {
+                                  setActivityResourceName(resource.name);
+                                  setActivityResourceDropdownOpen(false);
+                                }}
+                                style={({ pressed }) => [styles.opcaoRecursoModal, pressed && styles.botaoPressionado]}
+                              >
+                                <Text style={styles.textoOpcaoRecursoModal}>{resource.name}</Text>
+                              </Pressable>
+                            ))}
+                          </ScrollView>
                           {activityResourceOptions.length === 0 && <Text style={styles.mensagemVaziaModalAtividade}>Todos os recursos desta categoria já foram adicionados.</Text>}
                         </View>
                       )}
@@ -1103,13 +1503,58 @@ function AppContent({
                           ))}
                         </View>
                       )}
+                      {/* Tempo opcional: campos vazios são interpretados como construção instantânea. */}
+                      <Text style={styles.rotuloTempoConstrucao}>Tempo de construção (HH:MM:SS)</Text>
+                      <Text style={styles.ajudaTempoConstrucao}>
+                        Deixe vazio ou use 00:00:00 para construção instantânea.
+                      </Text>
+                      <View style={styles.entradaTempoConstrucao}>
+                        <TextInput
+                          accessibilityLabel="Horas de construção, opcional"
+                          keyboardType="number-pad"
+                          maxLength={2}
+                          onChangeText={(valor) => setHorasConstrucao(valor.replace(/[^0-9]/g, '').slice(0, 2))}
+                          placeholder="HH"
+                          placeholderTextColor="#817B91"
+                          selectTextOnFocus
+                          style={styles.campoTempoConstrucao}
+                          value={horasConstrucao}
+                        />
+                        <Text style={styles.separadorTempoConstrucao}>:</Text>
+                        <TextInput
+                          accessibilityLabel="Minutos de construção, opcional"
+                          keyboardType="number-pad"
+                          maxLength={2}
+                          onChangeText={(valor) => setMinutosConstrucao(valor.replace(/[^0-9]/g, '').slice(0, 2))}
+                          placeholder="MM"
+                          placeholderTextColor="#817B91"
+                          selectTextOnFocus
+                          style={styles.campoTempoConstrucao}
+                          value={minutosConstrucao}
+                        />
+                        <Text style={styles.separadorTempoConstrucao}>:</Text>
+                        <TextInput
+                          accessibilityLabel="Segundos de construção, opcional"
+                          keyboardType="number-pad"
+                          maxLength={2}
+                          onChangeText={(valor) => setSegundosConstrucao(valor.replace(/[^0-9]/g, '').slice(0, 2))}
+                          placeholder="SS"
+                          placeholderTextColor="#817B91"
+                          selectTextOnFocus
+                          style={styles.campoTempoConstrucao}
+                          value={segundosConstrucao}
+                        />
+                      </View>
+                      {(Number(minutosConstrucao) > 59 || Number(segundosConstrucao) > 59) && (
+                        <Text style={styles.avisoTempoConstrucao}>Minutos e segundos devem ficar entre 00 e 59.</Text>
+                      )}
                     </ScrollView>
                     {/* ações para cancelar ou salvar a atividade */}
                     <View style={styles.acoesModalCadastro}>
                       <Pressable accessibilityRole="button" onPress={() => closeActivityModal()} style={({ pressed }) => [styles.botaoModalCadastro, pressed && styles.botaoPressionado]}>
                         <Text style={styles.textoBotaoModal}>Cancelar</Text>
                       </Pressable>
-                      <Pressable accessibilityRole="button" disabled={activityName.trim().length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0} onPress={saveActivity} style={({ pressed }) => [styles.botaoModalCadastro, (activityName.trim().length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0) && styles.toolbarBotaoDesabilitado, pressed && styles.botaoPressionado]}>
+                      <Pressable accessibilityRole="button" disabled={activityName.trim().length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0 || Number(minutosConstrucao) > 59 || Number(segundosConstrucao) > 59} onPress={saveActivity} style={({ pressed }) => [styles.botaoModalCadastro, (activityName.trim().length === 0 || activityCategory.length === 0 || selectedActivityResources.length === 0 || Number(minutosConstrucao) > 59 || Number(segundosConstrucao) > 59) && styles.toolbarBotaoDesabilitado, pressed && styles.botaoPressionado]}>
                         <Text style={styles.textoBotaoModal}>Salvar</Text>
                       </Pressable>
                     </View>
@@ -1185,7 +1630,7 @@ function AppContent({
                                 <Pressable
                                   accessibilityLabel={`Adicionar unidades de ${item.name}`}
                                   accessibilityRole="button"
-                                  disabled={inventoryResource === undefined}
+                                  disabled={inventoryResource === undefined || activityDetails.terminaConstrucaoEm !== undefined}
                                   onPress={() => {
                                     if (inventoryResource === undefined) {
                                       return;
@@ -1198,7 +1643,7 @@ function AppContent({
                                   }}
                                   style={({ pressed }) => [
                                     styles.botaoAdicionarRecursoDetalhe,
-                                    inventoryResource === undefined && styles.componenteDesabilitado,
+                                    (inventoryResource === undefined || activityDetails.terminaConstrucaoEm !== undefined) && styles.componenteDesabilitado,
                                     pressed && styles.botaoPressionado,
                                   ]}
                                 >
@@ -1207,19 +1652,23 @@ function AppContent({
                               </View>
                               {isExpanded && (
                                 <View style={styles.formularioAdicionarEstoque}>
-                                  {/* campo numérico para a quantidade adquirida */}
-                                  <TextInput
-                                    accessibilityLabel={`Unidades adquiridas de ${item.name}`}
-                                    keyboardType="numeric"
-                                    maxLength={12}
-                                    onChangeText={(value) => setAcquiredQuantity(value.replace(/[^0-9]/g, ''))}
-                                    onSubmitEditing={() => addAcquiredQuantity(item.name)}
-                                    placeholder="Unidades obtidas"
-                                    placeholderTextColor="#B8B4C6"
-                                    returnKeyType="done"
-                                    style={styles.campoQuantidadeAdquirida}
-                                    value={acquiredQuantity}
-                                  />
+                                  <View style={styles.conteudoFlexivel}>
+                                    <Text style={styles.rotuloCampoModal}>
+                                      Unidades obtidas<Text style={styles.asteriscoObrigatorio}> *</Text>
+                                    </Text>
+                                    <TextInput
+                                      accessibilityLabel={`Unidades adquiridas de ${item.name}, obrigatório`}
+                                      keyboardType="numeric"
+                                      maxLength={12}
+                                      onChangeText={(value) => setAcquiredQuantity(value.replace(/[^0-9]/g, ''))}
+                                      onSubmitEditing={() => addAcquiredQuantity(item.name)}
+                                      placeholder="Unidades obtidas"
+                                      placeholderTextColor="#B8B4C6"
+                                      returnKeyType="done"
+                                      style={styles.campoQuantidadeAdquirida}
+                                      value={acquiredQuantity}
+                                    />
+                                  </View>
                                   {/* soma a quantidade digitada ao estoque do recurso */}
                                   <Pressable
                                     accessibilityRole="button"
@@ -1240,12 +1689,50 @@ function AppContent({
                           );
                         }}
                       />
+                      <View style={styles.rodapeDetalheAtividade}>
+                        {activityDetails.terminaConstrucaoEm === undefined ? (
+                          detalhesAtividadeConcluidos ? (
+                            <Pressable
+                              accessibilityRole="button"
+                              onPress={iniciarConstrucaoAtividade}
+                              style={({ pressed }) => [styles.botaoAcaoConstrucao, pressed && styles.botaoPressionado]}
+                            >
+                              <Text style={styles.textoBotaoAcaoConstrucao}>Confirmar</Text>
+                            </Pressable>
+                          ) : (
+                            <Text style={styles.avisoDetalheAtividade}>
+                              Reúna os recursos necessários para confirmar esta atividade.
+                            </Text>
+                          )
+                        ) : activityDetails.terminaConstrucaoEm > horarioAtual ? (
+                          <View style={styles.estadoConstrucao}>
+                            <Text style={styles.rotuloEstadoConstrucao}>CONSTRUINDO</Text>
+                            <Text style={styles.tempoRestanteConstrucao}>
+                              {formatarDuracao(Math.ceil((activityDetails.terminaConstrucaoEm - horarioAtual) / 1000))}
+                            </Text>
+                          </View>
+                        ) : (
+                          <Pressable
+                            accessibilityRole="button"
+                            onPress={coletarAtividade}
+                            style={({ pressed }) => [styles.botaoAcaoConstrucao, pressed && styles.botaoPressionado]}
+                          >
+                            <Text style={styles.textoBotaoAcaoConstrucao}>Coletar</Text>
+                          </Pressable>
+                        )}
+                      </View>
                     </>
                   )}
                 </SafeAreaView>
               </KeyboardAvoidingView>
             </Modal>
           </ScrollView>
+          {/* Feedback de criação ou cancelamento da atividade. */}
+          {feedback !== null && (
+            <View style={[styles.popupFeedback, feedback.tipo === 'sucesso' ? styles.popupFeedbackSucesso : styles.popupFeedbackCancelado]}>
+              <Text style={styles.textoPopupFeedback}>{feedback.mensagem}</Text>
+            </View>
+          )}
           <FloatingHomeButton navigation={navigation} />
           <FloatingAddButton onPress={openActivityModal} />
         </SafeAreaView>
@@ -1386,7 +1873,7 @@ function AppContent({
                   ]}
                 >
                     {/* texto da seta de paginação */}
-                    <Text style={styles.setaPagina}>{'<<'}</Text>
+                    <Text style={styles.setaPagina}>{'\u2190'}</Text>
                 </Pressable>
                 {/* botão próxima página */}
                 <Pressable
@@ -1402,7 +1889,7 @@ function AppContent({
                   ]}
                 >
                   {/* texto da seta de paginação */}
-                  <Text style={styles.setaPagina}>{'>>'}</Text>
+                  <Text style={styles.setaPagina}>{'\u2192'}</Text>
                 </Pressable>
               </View>
             </View>
@@ -1425,7 +1912,7 @@ function AppContent({
                   {/* limpar remove os recursos visíveis e atividades que dependem deles */}
                   <Pressable
                     accessibilityRole="button"
-                    onPress={clearResourceList}
+                    onPress={limparListaRecursos}
                     style={({ pressed }) => [styles.botaoAcaoRecurso, pressed && styles.botaoPressionado]}
                   >
                     {/* texto e ícone do botão de limpar recursos*/}
@@ -1457,26 +1944,26 @@ function AppContent({
                       <Text style={styles.nomeRecurso}>{resource.name}</Text>
                     </View>
                     <Text style={styles.quantidadeRecurso}>{resource.quantity}</Text>
-                    {/* Botões de editar. */}
-                    <Pressable
-                      accessibilityRole="button"
-                      accessibilityLabel={`Editar ${resource.name}`}
-                      onPress={() => openResourceModal('edit', resource)}
-                      style={({ pressed }) => [styles.botaoIconeRecurso, pressed && styles.botaoPressionado]}
-                    >
-                      {/* Ícone de edição */}
-                      <Text style={styles.textoBotaoRecurso}>&#x270E;</Text>
-                    </Pressable>
-                    {/* excluir o recurso também exclui atividades que o utilizam */}
-                    <Pressable
-                      accessibilityRole="button"
-                      accessibilityLabel={`Excluir ${resource.name}`}
-                      onPress={() => deleteResource(resource)}
-                      style={({ pressed }) => [styles.botaoIconeRecurso, pressed && styles.botaoPressionado]}
-                    >
-                      {/* Ícone de exclusão */}
-                      <Text style={styles.textoBotaoRecurso}>&#10005;</Text>
-                    </Pressable>
+                    <View style={styles.acoesLinhaRecurso}>
+                      {/* Botões de editar e excluir. */}
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={`Editar ${resource.name}`}
+                        onPress={() => openResourceModal('edit', resource)}
+                        style={({ pressed }) => [styles.botaoIconeRecurso, pressed && styles.botaoPressionado]}
+                      >
+                        <Text style={styles.textoBotaoRecurso}>&#x270E;</Text>
+                      </Pressable>
+                      {/* Excluir o recurso também exclui atividades que o utilizam. */}
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={`Excluir ${resource.name}`}
+                        onPress={() => deleteResource(resource)}
+                        style={({ pressed }) => [styles.botaoIconeRecurso, pressed && styles.botaoPressionado]}
+                      >
+                        <Text style={styles.textoBotaoRecurso}>&#10005;</Text>
+                      </Pressable>
+                    </View>
                   </View>
                 ))}
               </ScrollView>
@@ -1494,6 +1981,12 @@ function AppContent({
                 style={styles.espacoFlexivel}
               >
                 <View style={styles.fundoModal}>
+                  <Pressable
+                    accessibilityLabel="Cancelar cadastro"
+                    accessibilityRole="button"
+                    onPress={() => (entryModalTab === 'category' ? closeCategoryModal() : closeResourceModal())}
+                    style={StyleSheet.absoluteFill}
+                  />
                   <View style={styles.modalCadastro}>
                     {/* Título, textos dos campos e rótulos das abas. */}
                     <Text style={styles.tituloModalCadastro}>
@@ -1504,23 +1997,31 @@ function AppContent({
                     {/* Placeholders, limites de texto e tipo de teclado dos campos. */}
                     <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} style={styles.conteudoComAlturaLimitada}>
                       {entryModalTab === 'category' ? (
-                        <TextInput
-                          accessibilityLabel="Nome da categoria"
-                          autoFocus
-                          maxLength={32}
-                          onChangeText={setCategoryName}
-                          onSubmitEditing={saveCategory}
-                          placeholder="Nome da categoria"
-                          placeholderTextColor="#B8B4C6"
-                          returnKeyType="done"
-                          style={styles.campoModalCadastro}
-                          value={categoryName}
-                        />
+                        <>
+                          <Text style={styles.rotuloCampoModal}>
+                            Nome da categoria<Text style={styles.asteriscoObrigatorio}> *</Text>
+                          </Text>
+                          <TextInput
+                            accessibilityLabel="Nome da categoria, obrigatório"
+                            autoFocus
+                            maxLength={32}
+                            onChangeText={setCategoryName}
+                            onSubmitEditing={saveCategory}
+                            placeholder="Nome da categoria"
+                            placeholderTextColor="#B8B4C6"
+                            returnKeyType="done"
+                            style={styles.campoModalCadastro}
+                            value={categoryName}
+                          />
+                        </>
                       ) : (
                         <>
                           {/* Placeholder e limite do nome do recurso. */}
+                          <Text style={styles.rotuloCampoModal}>
+                            Nome do recurso<Text style={styles.asteriscoObrigatorio}> *</Text>
+                          </Text>
                           <TextInput
-                            accessibilityLabel="Nome do recurso"
+                            accessibilityLabel="Nome do recurso, obrigatório"
                             autoFocus
                             maxLength={32}
                             onChangeText={setResourceName}
@@ -1530,8 +2031,11 @@ function AppContent({
                             value={resourceName}
                           />
                           {/* Teclado e limite de quantidade do recurso. */}
+                          <Text style={[styles.rotuloCampoModal, styles.rotuloComEspacamento]}>
+                            Quantidade<Text style={styles.asteriscoObrigatorio}> *</Text>
+                          </Text>
                           <TextInput
-                            accessibilityLabel="Quantidade do recurso"
+                            accessibilityLabel="Quantidade do recurso, obrigatório"
                             keyboardType="numeric"
                             maxLength={9}
                             onChangeText={(value) => setResourceQuantity(value.replace(/[^0-9]/g, ''))}
@@ -1541,11 +2045,14 @@ function AppContent({
                             value={resourceQuantity}
                           />
                           {/* botão de seleção de categoria */}
+                          <Text style={[styles.rotuloCampoModal, styles.rotuloComEspacamento]}>
+                            Categoria<Text style={styles.asteriscoObrigatorio}> *</Text>
+                          </Text>
                           <Pressable
                             accessibilityRole="button"
                             accessibilityState={{ expanded: resourceDropdownOpen }}
                             onPress={() => setResourceDropdownOpen((isOpen) => !isOpen)}
-                            style={({ pressed }) => [styles.seletorRecursoModal, pressed && styles.botaoPressionado]}
+                            style={({ pressed }) => [styles.seletorRecursoModal, styles.seletorAposRotulo, pressed && styles.botaoPressionado]}
                           >
                             <Text style={styles.textoSeletorRecursoModal}>
                               {resourceCategory || 'Escolha uma categoria'}
@@ -1631,6 +2138,43 @@ function AppContent({
                   </View>
                 </View>
               </KeyboardAvoidingView>
+            </Modal>
+
+            {/* ===== Confirmação visual para a limpeza da lista de recursos ===== */}
+            <Modal
+              animationType="fade"
+              transparent
+              visible={confirmacaoLimpezaRecursosVisivel}
+              onRequestClose={() => setConfirmacaoLimpezaRecursosVisivel(false)}
+            >
+              <View style={styles.fundoModal}>
+                <View style={styles.modalConfirmacao}>
+                  <Text style={styles.tituloModalCadastro}>Limpar lista de recursos?</Text>
+                  <Text style={styles.textoModalConfirmacao}>
+                    Os recursos visíveis e as atividades associadas serão excluídos. Esta ação não pode ser desfeita.
+                  </Text>
+                  <View style={styles.acoesModalCadastro}>
+                    <Pressable
+                      accessibilityRole="button"
+                      onPress={() => setConfirmacaoLimpezaRecursosVisivel(false)}
+                      style={({ pressed }) => [styles.botaoModalCadastro, pressed && styles.botaoPressionado]}
+                    >
+                      <Text style={styles.textoBotaoModal}>Cancelar</Text>
+                    </Pressable>
+                    <Pressable
+                      accessibilityRole="button"
+                      onPress={confirmarLimpezaListaRecursos}
+                      style={({ pressed }) => [
+                        styles.botaoModalCadastro,
+                        styles.botaoDestrutivoModal,
+                        pressed && styles.botaoPressionado,
+                      ]}
+                    >
+                      <Text style={styles.textoBotaoModal}>Limpar</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              </View>
             </Modal>
 
           </ScrollView>
@@ -1732,7 +2276,7 @@ function FloatingAddButton({ onPress }: { onPress: () => void }) {
       style={({ pressed }) => [styles.botaoFlutuanteAdicionar, pressed && styles.botaoFlutuanteCasaPressionado]}
     >
       {/* Símbolo do botão flutuante; troque apenas o caractere para mudar o ícone. */}
-      <Text style={styles.iconeFlutuanteAdicionar}>⊕</Text>
+      <Text style={styles.iconeFlutuanteAdicionar}>＋</Text>
     </Pressable>
   );
 }
@@ -1811,9 +2355,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 12,
   },
+  // ===== Aparência dos botões indisponíveis =====
   toolbarBotaoDesabilitado: {
-    backgroundColor: '#592F36',
-    borderColor: '#8A4A52',
+    backgroundColor: '#24242D',
+    borderColor: '#454151',
+    opacity: 0.42,
   },
   toolbarIcone: {
     color: '#C4B5FD',
@@ -2115,13 +2661,59 @@ const styles = StyleSheet.create({
     marginTop: 3,
   },
   situacaoAtividadeTutorial: {
-    backgroundColor: '#991B1B',
+    backgroundColor: '#166534',
+    borderColor: '#4ADE80',
     borderRadius: 5,
-    color: '#FEE2E2',
+    borderWidth: 1,
+    color: '#DCFCE7',
     fontSize: 8,
     fontWeight: '900',
     paddingHorizontal: 6,
     paddingVertical: 5,
+  },
+  tempoConstrucaoTutorial: {
+    alignItems: 'center',
+    backgroundColor: '#17171C',
+    borderColor: '#393544',
+    borderRadius: 5,
+    borderWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  rotuloTempoConstrucaoTutorial: {
+    color: '#B8B4C6',
+    fontSize: 8,
+    fontWeight: '900',
+  },
+  valorTempoConstrucaoTutorial: {
+    color: '#C4B5FD',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  botaoConstrucaoTutorial: {
+    alignItems: 'center',
+    backgroundColor: '#8B5CF6',
+    borderColor: '#C4B5FD',
+    borderRadius: 8,
+    borderWidth: 1,
+    justifyContent: 'center',
+    marginBottom: 12,
+    marginTop: 10,
+    minHeight: 38,
+  },
+  textoBotaoConstrucaoTutorial: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  descricaoPosAtividadeTutorial: {
+    color: '#B8B4C6',
+    fontSize: 11,
+    lineHeight: 17,
+    marginTop: 8,
   },
   linhaRecursoAtividadeTutorial: {
     alignItems: 'center', // opções: flex-start | flex-end | center | stretch | baseline
@@ -2218,6 +2810,51 @@ const styles = StyleSheet.create({
   modalDetalheAtividade: {
     backgroundColor: '#17171C',
     flex: 1,
+  },
+  rodapeDetalheAtividade: {
+    borderTopColor: '#393544',
+    borderTopWidth: 1,
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+  },
+  avisoDetalheAtividade: {
+    color: '#B8B4C6',
+    fontSize: 13,
+    textAlign: 'center',
+  },
+  estadoConstrucao: {
+    alignItems: 'center',
+    backgroundColor: '#2E2D38',
+    borderColor: '#5B4A82',
+    borderRadius: 10,
+    borderWidth: 1,
+    padding: 12,
+  },
+  rotuloEstadoConstrucao: {
+    color: '#C4B5FD',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.8,
+  },
+  tempoRestanteConstrucao: {
+    color: '#FFFFFF',
+    fontSize: 24,
+    fontWeight: '900',
+    marginTop: 4,
+  },
+  botaoAcaoConstrucao: {
+    alignItems: 'center',
+    backgroundColor: '#8B5CF6',
+    borderColor: '#C4B5FD',
+    borderRadius: 10,
+    borderWidth: 1,
+    justifyContent: 'center',
+    minHeight: 52,
+  },
+  textoBotaoAcaoConstrucao: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '900',
   },
   cabecalhoModalDetalheAtividade: {
     alignItems: 'center', // opções: flex-start | flex-end | center | stretch | baseline
@@ -2357,6 +2994,13 @@ const styles = StyleSheet.create({
     backgroundColor: '#302846',
     borderColor: '#8B5CF6',
   },
+  contadorConstrucao: {
+    color: '#C4B5FD',
+    fontSize: 12,
+    fontWeight: '800',
+    paddingHorizontal: 16,
+    paddingTop: 10,
+  },
   cabecalhoCartaoAtividade: {
     alignItems: 'center', // opções: flex-start | flex-end | center | stretch | baseline
     borderBottomColor: '#393544',
@@ -2378,6 +3022,12 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     marginTop: 3,
   },
+  tempoConstrucaoAtividade: {
+    color: '#C4B5FD',
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 4,
+  },
   situacaoAtividade: {
     borderRadius: 8,
     paddingHorizontal: 9,
@@ -2393,6 +3043,11 @@ const styles = StyleSheet.create({
     borderColor: '#4ADE80',
     borderWidth: 1,
   },
+  situacaoAtividadeConstruindo: {
+    backgroundColor: '#3A2D5D',
+    borderColor: '#8B5CF6',
+    borderWidth: 1,
+  },
   textoSituacaoAtividade: {
     fontSize: 9,
     fontWeight: '900',
@@ -2403,6 +3058,9 @@ const styles = StyleSheet.create({
   },
   textoSituacaoConcluida: {
     color: '#DCFCE7',
+  },
+  textoSituacaoConstruindo: {
+    color: '#DDD1FF',
   },
   listaRecursosAtividade: {
     paddingHorizontal: 12,
@@ -2547,13 +3205,13 @@ const styles = StyleSheet.create({
     borderColor: '#393544',
     borderTopWidth: 1,
     flexDirection: 'row',
+    gap: 8,
     minHeight: 64,
     paddingHorizontal: 10,
   },
   toolbarDivisor: {
     backgroundColor: '#454151',
     height: 28,
-    marginHorizontal: 8,
     width: 1,
   },
   botaoPagina: {
@@ -2561,13 +3219,13 @@ const styles = StyleSheet.create({
     borderColor: '#5B4A82',
     borderRadius: 8,
     borderWidth: 1,
-    height: 42,
+    height: 48,
     justifyContent: 'center', // opções: flex-start | flex-end | center | space-between | space-around | space-evenly
-    width: 38,
+    width: 48,
   },
   setaPagina: {
     color: '#C4B5FD',
-    fontSize: 25,
+    fontSize: 30,
     fontWeight: '700',
   },
   toolbarRecurso: {
@@ -2602,6 +3260,10 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     minHeight: 58,
     paddingHorizontal: 12,
+  },
+  acoesLinhaRecurso: {
+    flexDirection: 'row',
+    gap: 8,
   },
   identidadeRecurso: {
     alignItems: 'center', // opções: flex-start | flex-end | center | stretch | baseline
@@ -2638,13 +3300,13 @@ const styles = StyleSheet.create({
     borderColor: '#5B4A82',
     borderRadius: 8,
     borderWidth: 1,
-    height: 42,
+    height: 48,
     justifyContent: 'center', // opções: flex-start | flex-end | center | space-between | space-around | space-evenly
-    width: 34,
+    width: 48,
   },
   textoBotaoRecurso: {
     color: '#C4B5FD',
-    fontSize: 17,
+    fontSize: 21,
     fontWeight: '700',
   },
   // ===== Estilos dos modais =====
@@ -2669,11 +3331,40 @@ const styles = StyleSheet.create({
     padding: 18,
     width: '100%',
   },
+  modalConfirmacao: {
+    backgroundColor: '#24242D',
+    borderColor: '#5B4A82',
+    borderRadius: 16,
+    borderWidth: 1,
+    maxWidth: 420,
+    padding: 18,
+    width: '100%',
+  },
+  textoModalConfirmacao: {
+    color: '#B8B4C6',
+    fontSize: 14,
+    lineHeight: 21,
+  },
   tituloModalCadastro: {
     color: '#FFFFFF',
     fontSize: 20,
     fontWeight: '900',
     marginBottom: 14,
+  },
+  // ===== Identificação dos campos obrigatórios nos formulários =====
+  rotuloCampoModal: {
+    color: '#D2CCDF',
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 6,
+    marginTop: 12,
+  },
+  rotuloComEspacamento: {
+    marginTop: 12,
+  },
+  asteriscoObrigatorio: {
+    color: '#EF4444',
+    fontWeight: '900',
   },
   campoModalCadastro: {
     backgroundColor: '#17171C',
@@ -2712,7 +3403,7 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
   },
   campoQuantidadeRecursoModal: {
-    marginTop: 10,
+    marginTop: 0,
   },
   acoesModalCadastro: {
     flexDirection: 'row',
@@ -2730,14 +3421,35 @@ const styles = StyleSheet.create({
     minHeight: 52,
     paddingHorizontal: 12,
   },
+  botaoDestrutivoModal: {
+    backgroundColor: '#991B1B',
+    borderColor: '#EF4444',
+  },
   linhaEntradaModalAtividade: {
     alignItems: 'center', // opções: flex-start | flex-end | center | stretch | baseline
     flexDirection: 'row',
     gap: 8,
     marginTop: 10,
   },
+  rotulosEntradaModalAtividade: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 2,
+  },
+  rotuloSeletorRecurso: {
+    flex: 1,
+    marginBottom: 0,
+  },
+  rotuloQuantidadeRecurso: {
+    marginBottom: 0,
+    textAlign: 'center',
+    width: 72,
+  },
   seletorRecursoModalAtividade: {
     flex: 1,
+    marginTop: 0,
+  },
+  seletorAposRotulo: {
     marginTop: 0,
   },
   quantidadeModalAtividade: {
@@ -2755,6 +3467,47 @@ const styles = StyleSheet.create({
   botaoAdicionarRecursoModalAtividade: {
     justifyContent: 'center', // opções: flex-start | flex-end | center | space-between | space-around | space-evenly
     marginTop: 10,
+  },
+  rotuloTempoConstrucao: {
+    color: '#D2CCDF',
+    fontSize: 13,
+    fontWeight: '800',
+    marginTop: 16,
+  },
+  ajudaTempoConstrucao: {
+    color: '#A7A1B5',
+    fontSize: 12,
+    marginTop: 4,
+  },
+  entradaTempoConstrucao: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 6,
+    justifyContent: 'flex-start',
+    marginTop: 8,
+  },
+  campoTempoConstrucao: {
+    backgroundColor: '#17171C',
+    borderColor: '#5B4A82',
+    borderRadius: 8,
+    borderWidth: 1,
+    color: '#FFFFFF',
+    fontSize: 18,
+    fontWeight: '800',
+    minHeight: 48,
+    paddingHorizontal: 8,
+    textAlign: 'center',
+    width: 62,
+  },
+  separadorTempoConstrucao: {
+    color: '#C4B5FD',
+    fontSize: 20,
+    fontWeight: '800',
+  },
+  avisoTempoConstrucao: {
+    color: '#FCA5A5',
+    fontSize: 12,
+    marginTop: 6,
   },
   listaSelecionadosModalAtividade: {
     backgroundColor: '#17171C',
@@ -2800,6 +3553,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     marginTop: 6,
     maxHeight: 150,
+    overflow: 'hidden',
+  },
+  listaOpcoesRecursoModal: {
+    maxHeight: 148,
   },
   opcaoRecursoModal: {
     borderBottomColor: '#393544',
