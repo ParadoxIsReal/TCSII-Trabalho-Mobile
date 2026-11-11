@@ -13,10 +13,11 @@ import {scheduleNotificationAsync} from 'expo-notifications/build/scheduleNotifi
 import {cancelScheduledNotificationAsync} from 'expo-notifications/build/cancelScheduledNotificationAsync';
 import {createContext, useContext, useEffect, useRef, useState} from 'react';
 import type {Dispatch, SetStateAction} from 'react';
+import {backupAppDataToSupabase, getSupabaseClient, restoreAppDataFromSupabase} from './src/services/supabaseBackup';
 import {createNavigationContainerRef, NavigationContainer} from '@react-navigation/native';
 import {createNativeStackNavigator, NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {SafeAreaProvider, SafeAreaView} from 'react-native-safe-area-context';
-import {Animated,FlatList,KeyboardAvoidingView,Modal,  Platform,Pressable,PanResponder,ScrollView,StyleSheet,Text,TextInput,View} from 'react-native';
+import {Alert,Animated,AppState,FlatList,KeyboardAvoidingView,Modal,  Platform,Pressable,PanResponder,ScrollView,StyleSheet,Text,TextInput,View} from 'react-native';
 import React from 'react';
 
 // ==================== Navegação e tipos ====================
@@ -258,6 +259,29 @@ export default function App() {
   const [navegacaoPronta, setNavegacaoPronta] = useState(false);
   const [idAtividadePendente, setIdAtividadePendente] = useState<string | null>(null);
 
+  // Mantém a renovação do JWT ativa em primeiro plano e pausa ao sair do app.
+  useEffect(() => {
+    const client = getSupabaseClient();
+    if (client === null) {
+      return undefined;
+    }
+
+    const atualizarSessao = (state: string | null | undefined) => {
+      if (state === 'active') {
+        client.auth.startAutoRefresh();
+      } else {
+        client.auth.stopAutoRefresh();
+      }
+    };
+    const inscricaoAppState = AppState.addEventListener('change', atualizarSessao);
+    atualizarSessao(AppState.currentState);
+
+    return () => {
+      inscricaoAppState.remove();
+      client.auth.stopAutoRefresh();
+    };
+  }, []);
+
   // ===== Abertura de atividade a partir de uma notificação =====
   useEffect(() => {
     const tratarRespostaNotificacao = (resposta: NotificationResponse) => {
@@ -324,6 +348,122 @@ export default function App() {
   );
 }
 
+// Dados compartilhados pelo botão de backup/restauração nas duas telas.
+type SupabaseBackupData = {
+  categoryPages: string[][];
+  resources: Resource[];
+  activities: Activity[];
+};
+
+// Reúne as ações remotas e apresenta o resultado ao lado dos botões.
+function SupabaseBackupButton({data, onRestore}: {data: SupabaseBackupData; onRestore: (data: SupabaseBackupData) => void}) {
+  const [status, setStatus] = useState<'idle' | 'loading' | 'restoring' | 'success' | 'error' | 'empty'>('idle');
+  const [message, setMessage] = useState('');
+
+  // Envia o estado completo do app para o registro do usuário atual.
+  const saveBackup = async () => {
+    if (status === 'loading' || status === 'restoring') {
+      return;
+    }
+
+    const hasData = data.categoryPages.some((page) => page.length > 0)
+      || data.resources.length > 0
+      || data.activities.length > 0;
+
+    if (!hasData) {
+      setStatus('empty');
+      setMessage('Não há dados para salvar no backup.');
+      return;
+    }
+
+    setStatus('loading');
+    setMessage('Enviando backup...');
+
+    try {
+      await backupAppDataToSupabase(data);
+      setStatus('success');
+      setMessage('Backup salvo no Supabase.');
+    } catch (error) {
+      setStatus('error');
+      setMessage(error instanceof Error ? `Falha no backup: ${error.message}` : 'Falha ao enviar o backup.');
+    }
+  };
+
+  // Busca o registro e aplica seus dados somente depois da confirmação.
+  const restoreBackup = async () => {
+    if (status === 'loading' || status === 'restoring') {
+      return;
+    }
+
+    setStatus('restoring');
+    setMessage('Buscando backup...');
+
+    try {
+      const backup = await restoreAppDataFromSupabase();
+      if (backup === null) {
+        setStatus('empty');
+        setMessage('Não há backup salvo para esta instalação.');
+        return;
+      }
+
+      onRestore(backup);
+      setStatus('success');
+      setMessage('Backup restaurado. Os dados locais foram substituídos.');
+    } catch (error) {
+      setStatus('error');
+      setMessage(error instanceof Error ? `Falha ao restaurar: ${error.message}` : 'Falha ao restaurar o backup.');
+    }
+  };
+
+  // A confirmação evita substituir dados locais por um toque acidental.
+  const confirmRestore = () => {
+    Alert.alert(
+      'Restaurar backup?',
+      'Os dados locais serão substituídos pelos dados do backup. Esta ação não pode ser desfeita.',
+      [
+        {text: 'Cancelar', style: 'cancel'},
+        {text: 'Restaurar', style: 'destructive', onPress: () => { void restoreBackup(); }},
+      ],
+    );
+  };
+
+  const busy = status === 'loading' || status === 'restoring';
+
+  return (
+    <View style={styles.areaBackup}>
+      <View style={styles.acoesBackup}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityState={{disabled: busy}}
+          disabled={busy}
+          onPress={saveBackup}
+          style={({pressed}) => [styles.botaoBackup, busy && styles.botaoBackupCarregando, pressed && styles.botaoPressionado]}
+        >
+          <Text style={styles.textoBotaoBackup}>Fazer backup</Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityState={{disabled: busy}}
+          disabled={busy}
+          onPress={confirmRestore}
+          style={({pressed}) => [styles.botaoBackup, busy && styles.botaoBackupCarregando, pressed && styles.botaoPressionado]}
+        >
+          <Text style={styles.textoBotaoBackup}>Restaurar backup</Text>
+        </Pressable>
+      </View>
+      {message.length > 0 && (
+        <Text style={[
+          styles.mensagemBackup,
+          status === 'success' && styles.mensagemBackupSucesso,
+          (status === 'error' || status === 'empty') && styles.mensagemBackupErro,
+        ]}>
+          {message}
+        </Text>
+      )}
+    </View>
+  );
+}
+
 // ==================== Estado, regras e telas ====================
 function AppContent({
   screen,
@@ -344,6 +484,13 @@ function AppContent({
     activities,
     setActivities,
   } = useAppData();
+
+  // Atualiza o contexto; o provider persiste as listas restauradas no AsyncStorage.
+  const aplicarBackupRestaurado = (backup: SupabaseBackupData) => {
+    setCategoryPages(backup.categoryPages);
+    setResources(backup.resources);
+    setActivities(backup.activities);
+  };
   const [categoryPage, setCategoryPage] = useState(0);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [entryModalVisible, setEntryModalVisible] = useState(false);
@@ -1399,6 +1546,7 @@ function AppContent({
                 );
               })}
             </View>
+            <SupabaseBackupButton data={{categoryPages, resources, activities}} onRestore={aplicarBackupRestaurado} />
             {/* ===== Modal de criação: título, placeholders e rótulos dos botões editáveis abaixo ===== */}
             {/* Modal renderiza acima da tela; onRequestClose recebe o botão Voltar do Android. */}
             <Modal
@@ -2176,7 +2324,7 @@ function AppContent({
                 </View>
               </View>
             </Modal>
-
+            <SupabaseBackupButton data={{categoryPages, resources, activities}} onRestore={aplicarBackupRestaurado} />
           </ScrollView>
           {/* Popup de feedback sobre a operação realizada */}
           {feedback !== null && (
@@ -2185,6 +2333,7 @@ function AppContent({
             </View>
           )}
           <FloatingHomeButton navigation={navigation} />
+
           <FloatingAddButton onPress={openEntryModal} />
         </SafeAreaView>
       );
@@ -2321,7 +2470,47 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   containerComRodape: {
-    paddingBottom: 40,
+    paddingBottom: 110,
+  },
+  areaBackup: {
+    marginTop: 28,
+  },
+  acoesBackup: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  botaoBackup: {
+    alignItems: 'center',
+    backgroundColor: '#8B5CF6',
+    borderColor: '#C4B5FD',
+    borderRadius: 10,
+    borderWidth: 1,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 50,
+    paddingHorizontal: 8,
+  },
+  botaoBackupCarregando: {
+    opacity: 0.65,
+  },
+  textoBotaoBackup: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  mensagemBackup: {
+    color: '#D6D3E0',
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 8,
+    textAlign: 'center',
+  },
+  mensagemBackupSucesso: {
+    color: '#86EFAC',
+  },
+  mensagemBackupErro: {
+    color: '#FCA5A5',
   },
   conteudoComAlturaLimitada: {
     maxHeight: 360,
@@ -2512,7 +2701,7 @@ const styles = StyleSheet.create({
   },
   // ===== Estilos da tela de tutoriais =====
   containerTutorial: {
-    paddingBottom: 42,
+    paddingBottom: 160,
   },
   cabecalhoInterno: {
     paddingBottom: 30,

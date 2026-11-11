@@ -39,6 +39,8 @@ Categorias, recursos, atividades e os prazos das construções em andamento são
 
 Pré-requisitos: Node.js e npm.
 
+Para configurar o backup remoto, habilite login anônimo no Supabase e confira as variáveis `EXPO_PUBLIC_SUPABASE_URL` e `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY` no `.env`. Execute o SQL e configure a RLS conforme [Etapa 06 - Backup remoto](docs/etapa-06.md). Reinicie o Expo após configurar as variáveis.
+
 ```bash
 npm install
 npx expo start --tunnel
@@ -64,3 +66,4 @@ npm exec tsc -- --noEmit
 - [Etapa 02](docs/etapa-02.md)
 - [Etapa 03](docs/etapa-03.md)
 - [Etapa 05 - Atividades, estoque e construção](docs/etapa-05.md)
+- [Etapa 06 - Backup remoto](docs/etapa-06.md)
