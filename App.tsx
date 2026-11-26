@@ -1,24 +1,10 @@
 import {StatusBar} from 'expo-status-bar';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import type {NotificationResponse} from 'expo-notifications/build/Notifications.types';
-import {SchedulableTriggerInputTypes} from 'expo-notifications/build/Notifications.types';
-import {
-  addNotificationResponseReceivedListener,
-  clearLastNotificationResponseAsync,
-  getLastNotificationResponseAsync,
-} from 'expo-notifications/build/NotificationsEmitter';
-import {getPermissionsAsync, requestPermissionsAsync} from 'expo-notifications/build/NotificationPermissions';
-import {setNotificationHandler} from 'expo-notifications/build/NotificationsHandler';
-import {scheduleNotificationAsync} from 'expo-notifications/build/scheduleNotificationAsync';
-import {cancelScheduledNotificationAsync} from 'expo-notifications/build/cancelScheduledNotificationAsync';
-import {createContext, useContext, useEffect, useRef, useState} from 'react';
-import type {Dispatch, SetStateAction} from 'react';
+import {useEffect, useRef, useState} from 'react';
 import {backupAppDataToSupabase, getSupabaseClient, restoreAppDataFromSupabase} from './src/services/supabaseBackup';
-import {createNavigationContainerRef, NavigationContainer} from '@react-navigation/native';
+import {NavigationContainer} from '@react-navigation/native';
 import {createNativeStackNavigator, NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {SafeAreaProvider, SafeAreaView} from 'react-native-safe-area-context';
 import {Alert,Animated,AppState,FlatList,KeyboardAvoidingView,Modal,  Platform,Pressable,PanResponder,ScrollView,StyleSheet,Text,TextInput,View} from 'react-native';
-import React from 'react';
 
 // ==================== Navegação e tipos ====================
 type Screen = 'home' | 'tutorials' | 'setup' | 'tracking';
@@ -28,21 +14,10 @@ type RootStackParamList = {
   home: undefined;
   tutorials: undefined;
   setup: undefined;
-  tracking: {idAtividade?: string} | undefined;
+  tracking: undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
-const referenciaNavegacao = createNavigationContainerRef<RootStackParamList>();
-
-// ===== Configuração para exibir notificações locais com o app aberto =====
-setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowBanner: true,
-    shouldShowList: true,
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-  }),
-});
 
 // Cartões da tela inicial: altere título, descrição, etapa e símbolo aqui.
 const actions: Array<{
@@ -91,14 +66,6 @@ type Activity = {
   resources: Array<{ name: string; required: number }>;
   tempoConstrucaoSegundos: number;
   terminaConstrucaoEm?: number;
-  idNotificacao?: string;
-};
-
-type AtividadePersistidaLegada = Partial<Activity> & Pick<Activity, 'name' | 'category' | 'resources'> & {
-  activityId?: unknown;
-  constructionTimeSeconds?: unknown;
-  constructionEndsAt?: unknown;
-  notificationId?: unknown;
 };
 
 // ===== Formatação do tempo de construção =====
@@ -109,156 +76,8 @@ const formatarDuracao = (totalSegundos: number) => {
   return [horas, minutos, segundos].map((parte) => String(parte).padStart(2, '0')).join(':');
 };
 
-// ==================== Dados iniciais para testes ====================
-// Categorias e estoques de exemplo; Madeira existe nas duas categorias para testar o vínculo correto.
-const categoriasIniciais = [['Fazenda', 'Aventura']];
-const recursosIniciais: Resource[] = [
-  { id: 'teste-1', icon: '*', name: 'Madeira', quantity: 'x18', category: 'Fazenda' },
-  { id: 'teste-2', icon: '#', name: 'Ferro', quantity: 'x5', category: 'Fazenda' },
-  { id: 'teste-3', icon: '+', name: 'Pedra', quantity: 'x0', category: 'Fazenda' },
-  { id: 'teste-4', icon: '*', name: 'Madeira', quantity: 'x3', category: 'Aventura' },
-  { id: 'teste-5', icon: '%', name: 'Cristal', quantity: 'x7', category: 'Aventura' },
-];
-
-// Dados do domínio persistidos entre execuções; estado de interface fica fora deste tipo.
-type AppData = {
-  categoryPages: string[][];
-  resources: Resource[];
-  activities: Activity[];
-};
-
-type AppDataContextValue = AppData & {
-  setCategoryPages: Dispatch<SetStateAction<string[][]>>;
-  setResources: Dispatch<SetStateAction<Resource[]>>;
-  setActivities: Dispatch<SetStateAction<Activity[]>>;
-};
-
-// Uma única chave mantém categorias, recursos e atividades sincronizados.
-const APP_DATA_STORAGE_KEY = 'farm-helper-app-data';
-const AppDataContext = createContext<AppDataContextValue | null>(null);
-
-// Mantém os dados compartilhados entre as rotas e centraliza leitura e gravação local.
-function AppDataProvider({children}: {children: React.ReactNode}) {
-  const [categoryPages, setCategoryPages] = useState<string[][]>(categoriasIniciais);
-  const [resources, setResources] = useState<Resource[]>(recursosIniciais);
-  const [activities, setActivities] = useState<Activity[]>([]);
-  const [isLoaded, setIsLoaded] = useState(false);
-
-  useEffect(() => {
-    // Evita atualizar o estado depois que o provider for desmontado durante a leitura.
-    let isMounted = true;
-
-    const loadData = async () => {
-      try {
-        const savedData = await AsyncStorage.getItem(APP_DATA_STORAGE_KEY);
-
-        if (savedData !== null) {
-          // Usa os dados disponíveis e mantém os exemplos para campos ausentes ou inválidos.
-          const parsedData = JSON.parse(savedData) as Partial<AppData>;
-
-          if (Array.isArray(parsedData.categoryPages)) {
-            setCategoryPages(parsedData.categoryPages);
-          }
-          if (Array.isArray(parsedData.resources)) {
-            setResources(parsedData.resources);
-          }
-          if (Array.isArray(parsedData.activities)) {
-            // Migra campos antigos em inglês para o formato atual sem perder construções em andamento.
-            setActivities(parsedData.activities.map((atividade, indice) => {
-              const atividadeLegada = atividade as AtividadePersistidaLegada;
-              const tempoSalvo = atividadeLegada.tempoConstrucaoSegundos
-                ?? atividadeLegada.constructionTimeSeconds;
-              const fimConstrucaoSalvo = atividadeLegada.terminaConstrucaoEm
-                ?? atividadeLegada.constructionEndsAt;
-              const idNotificacaoSalvo = atividadeLegada.idNotificacao
-                ?? atividadeLegada.notificationId;
-
-              return {
-                id: typeof atividadeLegada.id === 'string' && atividadeLegada.id.length > 0
-                  ? atividadeLegada.id
-                  : `legacy-${indice}-${atividadeLegada.name}`,
-                name: atividadeLegada.name,
-                category: atividadeLegada.category,
-                resources: atividadeLegada.resources,
-                tempoConstrucaoSegundos: typeof tempoSalvo === 'number'
-                  && Number.isSafeInteger(tempoSalvo)
-                  && tempoSalvo >= 0
-                  ? tempoSalvo
-                  : 0,
-                terminaConstrucaoEm: typeof fimConstrucaoSalvo === 'number'
-                  && Number.isSafeInteger(fimConstrucaoSalvo)
-                  ? fimConstrucaoSalvo
-                  : undefined,
-                idNotificacao: typeof idNotificacaoSalvo === 'string'
-                  ? idNotificacaoSalvo
-                  : undefined,
-              };
-            }));
-          }
-        }
-      } catch (error) {
-        console.warn('Não foi possível carregar os dados salvos.', error);
-      } finally {
-        if (isMounted) {
-          setIsLoaded(true);
-        }
-      }
-    };
-
-    loadData();
-    return () => {
-      isMounted = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    // Aguarda a hidratação para não sobrescrever dados salvos com os valores iniciais.
-    if (!isLoaded) {
-      return;
-    }
-
-    // Persiste somente listas e categorias, não formulários ou seleções temporárias.
-    const appData: AppData = {categoryPages, resources, activities};
-    AsyncStorage.setItem(APP_DATA_STORAGE_KEY, JSON.stringify(appData)).catch((error) => {
-      console.warn('Não foi possível salvar os dados.', error);
-    });
-  }, [activities, categoryPages, isLoaded, resources]);
-
-  // Não monta a navegação até terminar a leitura do armazenamento local.
-  if (!isLoaded) {
-    return null;
-  }
-
-  return (
-    <AppDataContext.Provider value={{
-      categoryPages,
-      resources,
-      activities,
-      setCategoryPages,
-      setResources,
-      setActivities,
-    }}>
-      {children}
-    </AppDataContext.Provider>
-  );
-}
-
-// Expõe os dados compartilhados para as telas dentro do provider.
-function useAppData() {
-  const appData = useContext(AppDataContext);
-
-  if (appData === null) {
-    throw new Error('useAppData deve ser usado dentro de AppDataProvider.');
-  }
-
-  return appData;
-}
-
 // ==================== Navegador principal ====================
 export default function App() {
-  const [navegacaoPronta, setNavegacaoPronta] = useState(false);
-  const [idAtividadePendente, setIdAtividadePendente] = useState<string | null>(null);
-
   // Mantém a renovação do JWT ativa em primeiro plano e pausa ao sair do app.
   useEffect(() => {
     const client = getSupabaseClient();
@@ -282,69 +101,25 @@ export default function App() {
     };
   }, []);
 
-  // ===== Abertura de atividade a partir de uma notificação =====
-  useEffect(() => {
-    const tratarRespostaNotificacao = (resposta: NotificationResponse) => {
-      const dadosNotificacao = resposta.notification.request.content.data;
-      const idAtividade = dadosNotificacao?.idAtividade ?? dadosNotificacao?.activityId;
-      if (typeof idAtividade === 'string') {
-        setIdAtividadePendente(idAtividade);
-      }
-    };
-    const inscricaoRespostaNotificacao = addNotificationResponseReceivedListener(tratarRespostaNotificacao);
-
-    getLastNotificationResponseAsync()
-      .then((resposta) => {
-        if (resposta !== null) {
-          tratarRespostaNotificacao(resposta);
-          return clearLastNotificationResponseAsync();
-        }
-        return undefined;
-      })
-      .catch((erro: unknown) => {
-        console.warn('Não foi possível recuperar a abertura pela notificação.', erro);
-      });
-
-    return () => inscricaoRespostaNotificacao.remove();
-  }, []);
-
-  // Aguarda o navegador ficar pronto antes de abrir a rota recebida.
-  useEffect(() => {
-    if (!navegacaoPronta || idAtividadePendente === null) {
-      return;
-    }
-
-    referenciaNavegacao.navigate('tracking', {idAtividade: idAtividadePendente});
-    setIdAtividadePendente(null);
-  }, [navegacaoPronta, idAtividadePendente]);
-
   return (
-    <AppDataProvider>
-      <SafeAreaProvider>
-        <NavigationContainer ref={referenciaNavegacao} onReady={() => setNavegacaoPronta(true)}>
-          <Stack.Navigator initialRouteName="home" screenOptions={{ headerShown: false }}>
-            <Stack.Screen name="home">
-              {(props) => <AppContent screen="home" navigation={props.navigation} />}
-            </Stack.Screen>
-            <Stack.Screen name="tutorials">
-              {(props) => <AppContent screen="tutorials" navigation={props.navigation} />}
-            </Stack.Screen>
-            <Stack.Screen name="setup">
-              {(props) => <AppContent screen="setup" navigation={props.navigation} />}
-            </Stack.Screen>
-            <Stack.Screen name="tracking">
-              {(props) => (
-                <AppContent
-                  screen="tracking"
-                  idAtividade={props.route.params?.idAtividade}
-                  navigation={props.navigation}
-                />
-              )}
-            </Stack.Screen>
-          </Stack.Navigator>
-        </NavigationContainer>
-      </SafeAreaProvider>
-    </AppDataProvider>
+    <SafeAreaProvider>
+      <NavigationContainer>
+        <Stack.Navigator initialRouteName="home" screenOptions={{ headerShown: false }}>
+          <Stack.Screen name="home">
+            {(props) => <AppContent screen="home" navigation={props.navigation} />}
+          </Stack.Screen>
+          <Stack.Screen name="tutorials">
+            {(props) => <AppContent screen="tutorials" navigation={props.navigation} />}
+          </Stack.Screen>
+          <Stack.Screen name="setup">
+            {(props) => <AppContent screen="setup" navigation={props.navigation} />}
+          </Stack.Screen>
+          <Stack.Screen name="tracking">
+            {(props) => <AppContent screen="tracking" navigation={props.navigation} />}
+          </Stack.Screen>
+        </Stack.Navigator>
+      </NavigationContainer>
+    </SafeAreaProvider>
   );
 }
 
@@ -467,15 +242,12 @@ function SupabaseBackupButton({data, onRestore}: {data: SupabaseBackupData; onRe
 // ==================== Estado, regras e telas ====================
 function AppContent({
   screen,
-  idAtividade,
   navigation,
 }: {
   screen: Screen;
-  idAtividade?: string;
   navigation: NativeStackNavigationProp<RootStackParamList>;
 }) {
   // ===== Estado da tela Categorias e recursos =====
-  // Listas persistidas são compartilhadas; seleção, paginação e valores dos modais são locais.
   const {
     categoryPages,
     setCategoryPages,
@@ -485,7 +257,6 @@ function AppContent({
     setActivities,
   } = useAppData();
 
-  // Atualiza o contexto; o provider persiste as listas restauradas no AsyncStorage.
   const aplicarBackupRestaurado = (backup: SupabaseBackupData) => {
     setCategoryPages(backup.categoryPages);
     setResources(backup.resources);
@@ -545,21 +316,6 @@ function AppContent({
     const timeout = setTimeout(() => setFeedback(null), 2600); // Numero 2600 é quanto ms fica visivel o aviso
     return () => clearTimeout(timeout); // Limpa o timer ao desmontar ou quando feedback muda.
   }, [feedback]);
-
-  // Abre o detalhe solicitado pela notificação e consome o parâmetro da rota.
-  useEffect(() => {
-    if (screen !== 'tracking' || idAtividade === undefined) {
-      return;
-    }
-
-    const atividade = activities.find((item) => item.id === idAtividade);
-    if (atividade !== undefined) {
-      setActivityDetails(atividade);
-      setExpandedInventoryResourceId(null);
-      setAcquiredQuantity('');
-    }
-    navigation.setParams({idAtividade: undefined});
-  }, [activities, idAtividade, navigation, screen]);
 
   // Atualiza a contagem regressiva somente enquanto a tela de atividades está aberta.
   useEffect(() => {
@@ -907,8 +663,7 @@ function AppContent({
     setExpandedInventoryResourceId(null);
     setAcquiredQuantity('');
   };
-  // Inicia a construção imediatamente; a notificação é complementar ao temporizador.
-  const iniciarConstrucaoAtividade = async () => {
+  const iniciarConstrucaoAtividade = () => {
     if (
       activityDetails === null
       || activityDetails.terminaConstrucaoEm !== undefined
@@ -952,72 +707,19 @@ function AppContent({
       setActivityDetails(atividadeAtualizada);
       setHorarioAtual(inicioEm);
       setFeedback({mensagem: 'Atividade confirmada; construção iniciada.', tipo: 'sucesso'});
-
-      if (atividadeParaIniciar.tempoConstrucaoSegundos > 0) {
-        try {
-          const permissoesAtuais = await getPermissionsAsync();
-          const permissoes = permissoesAtuais.granted
-            ? permissoesAtuais
-            : await requestPermissionsAsync();
-          if (!permissoes.granted) {
-            setFeedback({
-              mensagem: 'Construção iniciada, mas notificações estão desativadas.',
-              tipo: 'cancelado',
-            });
-            return;
-          }
-
-          const idNotificacao = await scheduleNotificationAsync({
-            content: {
-              title: 'Construção concluída',
-              body: `${atividadeParaIniciar.name} está pronta para coletar.`,
-              data: {idAtividade: atividadeParaIniciar.id},
-            },
-            trigger: {
-              type: SchedulableTriggerInputTypes.TIME_INTERVAL,
-              seconds: Math.max(1, Math.ceil((terminaConstrucaoEm - Date.now()) / 1000)),
-            },
-          });
-          setActivities((currentActivities) => currentActivities.map((activity) => (
-            activity.id === atividadeParaIniciar.id
-              ? {...activity, idNotificacao}
-              : activity
-          )));
-          setActivityDetails((currentActivity) => (
-            currentActivity?.id === atividadeParaIniciar.id
-              ? {...currentActivity, idNotificacao}
-              : currentActivity
-          ));
-        } catch (error) {
-          console.warn('Não foi possível agendar a notificação da atividade.', error);
-          setFeedback({
-            mensagem: `Construção iniciada, mas a notificação falhou: ${error instanceof Error ? error.message : String(error)}`,
-            tipo: 'cancelado',
-          });
-        }
-      }
     } finally {
       idsAtividadesIniciando.current.delete(atividadeParaIniciar.id);
     }
   };
-  // Remove a atividade pronta e cancela qualquer aviso que ainda esteja agendado.
+  // Remove a atividade pronta.
   const coletarAtividade = () => {
     if (activityDetails === null || activityDetails.terminaConstrucaoEm === undefined || activityDetails.terminaConstrucaoEm > Date.now()) {
       return;
     }
 
-    cancelarNotificacaoAtividade(activityDetails);
     setActivities((currentActivities) => currentActivities.filter((activity) => activity.id !== activityDetails.id));
     closeActivityDetails();
     setFeedback({mensagem: 'Atividade coletada e removida.', tipo: 'sucesso'});
-  };
-  const cancelarNotificacaoAtividade = (atividade: Activity) => {
-    if (atividade.idNotificacao === undefined) {
-      return;
-    }
-    cancelScheduledNotificationAsync(atividade.idNotificacao).catch((erro: unknown) => {
-      console.warn('Não foi possível cancelar a notificação da atividade removida.', erro);
-    });
   };
   // Soma unidades adquiridas ao recurso do inventário ligado à atividade atual.
   const addAcquiredQuantity = (name: string) => {
@@ -1202,7 +904,7 @@ function AppContent({
                   {/* título e explicação da etapa */}
                   <Text style={styles.tituloEtapaTutorial}>Crie e acompanhe atividades</Text>
                   <Text style={styles.descricaoEtapaTutorial}>
-                    Em Atividades, toque em ⊕ para escolher a categoria, adicionar os recursos necessários e definir o tempo de construção em HH:MM:SS. Use + nos detalhes para registrar recursos que reuniu. Quando todos os itens estiverem completos, toque em Confirmar: as quantidades são descontadas do estoque e a construção começa. Ao terminar, receba uma notificação que abre a atividade; toque em Coletar para removê-la. Com 00:00:00, a atividade fica pronta para coletar imediatamente.
+                    Em Atividades, toque em ⊕ para escolher a categoria, adicionar os recursos necessários e definir o tempo de construção em HH:MM:SS. Use + nos detalhes para registrar recursos que reuniu. Quando todos os itens estiverem completos, toque em Confirmar: as quantidades são descontadas do estoque e a construção começa. Ao terminar, toque em Coletar para removê-la. Com 00:00:00, a atividade fica pronta para coletar imediatamente.
                   </Text>
                   {/* exemplo visual de atividade pronta para iniciar a construção */}
                   <View style={[styles.superficie, styles.exemploAtividadeTutorial]}>
@@ -1236,7 +938,7 @@ function AppContent({
                     </View>
                   </View>
                   <Text style={styles.descricaoPosAtividadeTutorial}>
-                    Depois de confirmar: CONSTRUINDO → notificação ao terminar → Coletar.
+                    Depois de confirmar: CONSTRUINDO → PRONTA → Coletar.
                   </Text>
                 </View>
               </View>
@@ -1245,7 +947,7 @@ function AppContent({
             {/* dica resumida sobre categoria, estoque e atividades */}
             <View style={styles.dicaTutorial}>
               <Text style={styles.iconeDicaTutorial}>i</Text>
-              <Text style={styles.textoDicaTutorial}>O estoque é separado por categoria. Confirmar uma construção consome os recursos necessários; a notificação depende da permissão do telefone.</Text>
+              <Text style={styles.textoDicaTutorial}>O estoque é separado por categoria. Confirmar uma construção consome os recursos necessários.</Text>
             </View>
             {/* Modal de demonstração desativado nesta tela; o cadastro real fica em Atividades. */}
             <Modal
